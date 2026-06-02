@@ -70,6 +70,7 @@ class DBController:
         self.stop_command = self._resolve_command(lifecycle.get("stop"), config_path)
         self.stop_check_command = self._resolve_command(lifecycle.get("stop_check"), config_path)
         self.clear_log_command = self._resolve_command(lifecycle.get("clear_log"), config_path)
+        self.command_cwd = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(config_path)), "..", ".."))
         self.max_retries = int(lifecycle.get("max_retries", 120))
         self.max_start_minutes = int(lifecycle.get("max_minutes", 7))
 
@@ -79,7 +80,7 @@ class DBController:
         if self.remote:
             return self._execute_remote(command)
         try:
-            result = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            result = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.command_cwd)
             return result.stdout.decode('utf-8'), result.stderr.decode('utf-8')
         except subprocess.CalledProcessError as e:
             return e.stdout.decode("utf-8", errors="ignore"), e.stderr.decode("utf-8", errors="ignore") or str(e)
@@ -109,6 +110,8 @@ class DBController:
     def _resolve_command(self, command, config_path):
         if not command or self.remote:
             return command
+        if any(char.isspace() for char in str(command)):
+            return command
         if os.path.isabs(str(command)):
             return command
         config_dir = os.path.dirname(os.path.abspath(config_path))
@@ -121,6 +124,12 @@ class DBController:
     def stop(self):
         """执行关闭脚本"""
         return self._execute_script(self.stop_command)
+
+    def restart(self):
+        """Restart the managed database runtime."""
+        stop_stdout, stop_stderr = self.stop()
+        start_stdout, start_stderr = self.start()
+        return stop_stdout + start_stdout, stop_stderr + start_stderr
 
     def isStart(self):
         """执行是否启动成功脚本"""

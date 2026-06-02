@@ -32,6 +32,26 @@ def _require_sql_client():
 
 def _mysql_args(sql):
     client = _require_sql_client()
+    if client.get("mode") == "docker":
+        image = str(client.get("image", "mysql:5.7"))
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            str(client.get("network", "host")),
+            image,
+            "mysql",
+            "-h",
+            str(client["host"]),
+            "-P",
+            str(client["port"]),
+            "-u",
+            str(client["user"]),
+            f"-p{client['password']}",
+            "-e",
+            sql,
+        ]
     return [
         str(client.get("binary", "mysql")),
         "-h",
@@ -48,11 +68,42 @@ def _mysql_args(sql):
 
 def _mysql_command(sql, quote='"'):
     args = _mysql_args(sql)
+    if args[0] == "docker":
+        return subprocess.list2cmdline(args)
     executable, host_flag, host, port_flag, port, user_flag, user, password_arg, execute_flag, statement = args
     return (
         f"{executable} {host_flag} {host} {port_flag} {port} {user_flag} {user} "
         f"{password_arg} {execute_flag} {quote}{statement}{quote}"
     )
+
+
+def _mysql_source_args(filepath):
+    client = _require_sql_client()
+    if client.get("mode") == "docker":
+        image = str(client.get("image", "mysql:5.7"))
+        mount_dir = os.path.dirname(os.path.abspath(filepath))
+        mount_file = os.path.basename(filepath)
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            str(client.get("network", "host")),
+            "-v",
+            f"{mount_dir}:/workload:ro",
+            image,
+            "mysql",
+            "-h",
+            str(client["host"]),
+            "-P",
+            str(client["port"]),
+            "-u",
+            str(client["user"]),
+            f"-p{client['password']}",
+            "-e",
+            f"source /workload/{mount_file}",
+        ]
+    return _mysql_args(f"source {filepath}")
 
 
 def startTest(
@@ -94,7 +145,7 @@ def startTest(
         print(sqlCommand)
         status_code = os.system(sqlCommand)
     else:
-        result = subprocess.run(_mysql_args(f"source {sqlFilePath}"), check=False)
+        result = subprocess.run(_mysql_source_args(sqlFilePath), check=False)
         status_code = result.returncode
     end_time = time.time()
     print("执行命令结束，当前时间为 {}".format(end_time))
@@ -151,7 +202,7 @@ def handler(signum, frame):
 def execute_sqlfile(filepath):
     try:
         start_time = time.time()
-        command = _mysql_command(f"source {filepath}")
+        command = subprocess.list2cmdline(_mysql_source_args(filepath))
 
         signal.signal(signal.SIGALRM, handler)
         signal.alarm(_TIMEOUT_SECONDS)
@@ -184,9 +235,6 @@ def parallel_execute_sqlfile(db_controller, file_path, thread_count):
     end_time = time.time()
     total_time = end_time - start_time
     print(f"Total execution time: {total_time:.4f} seconds")
-    db_controller.stop()
-    print(isClosed(db_controller))
-
     if 999 in results:
         print("One or more SQL executions failed.")
         return total_time
@@ -207,7 +255,7 @@ def execute_sqlfile_withinfo(sql_statements):
                 command = _mysql_command(sql, quote="'")
             result = subprocess.run(command, shell=True, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             end_time = time.time()
-            execution_time = start_time - end_time
+            execution_time = end_time - start_time
             execution_info.append({"status_code": int(result.returncode), "execution_time": float(execution_time), "sql": index + 1})
         signal.alarm(0)
         total_end_time = time.time()
@@ -235,12 +283,9 @@ def parallel_execute_sqlfile_withinfo(db_controller, file_path, thread_count):
     end_time = time.time()
     total_time = end_time - start_time
     print(f"Total execution time: {total_time:.4f} seconds")
-    db_controller.stop()
-    print(isClosed(db_controller))
-
     if 999 in results:
         print("One or more SQL executions failed.")
-        return total_time
+        return total_time, summarize_sql_stats([item for item in results if isinstance(item, list)])
     return total_time, summarize_sql_stats(results)
 
 

@@ -1,5 +1,6 @@
 import argparse
 import json
+from pathlib import Path
 import tempfile
 
 from databases.factory import create_database_adapter
@@ -80,6 +81,8 @@ def create_adapter(database, adapter_options):
 def apply_and_run(adapter, sample, workload_path, concurrency):
     applied = adapter.get_true_values(sample) if hasattr(adapter, "get_true_values") else sample
     adapter.apply_config(sample)
+    if hasattr(adapter, "restart"):
+        adapter.restart()
     adapter.clear_output_log()
     total_time, query_info = adapter.run_workload_with_query_info(str(workload_path), concurrency)
     return {

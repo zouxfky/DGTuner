@@ -1,4 +1,6 @@
 import os
+import subprocess
+import tempfile
 
 def _new_ssh_client():
     import paramiko
@@ -218,6 +220,36 @@ def update_config_option_dict(filename, config_updates):
         f.writelines(lines)
 
     print(f"Config updated in '{filename}'.")
+
+
+def update_docker_yaml_config_dict(container, remote_path, config_updates):
+    """Update a YAML config file inside a local Docker container."""
+    if not config_updates:
+        return
+    with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as tmp_file:
+        local_path = tmp_file.name
+    try:
+        subprocess.run(["docker", "cp", f"{container}:{remote_path}", local_path], check=True)
+        update_yaml_config_dict(local_path, config_updates)
+        subprocess.run(["docker", "cp", local_path, f"{container}:{remote_path}"], check=True)
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+
+def update_docker_config_option_dict(container, remote_path, config_updates):
+    """Update a gflags config file inside a local Docker container."""
+    if not config_updates:
+        return
+    with tempfile.NamedTemporaryFile(suffix=".conf", delete=False) as tmp_file:
+        local_path = tmp_file.name
+    try:
+        subprocess.run(["docker", "cp", f"{container}:{remote_path}", local_path], check=True)
+        update_config_option_dict(local_path, config_updates)
+        subprocess.run(["docker", "cp", local_path, f"{container}:{remote_path}"], check=True)
+    finally:
+        if os.path.exists(local_path):
+            os.remove(local_path)
 def update_remote_config_option_dict(remote_host, remote_path, config_updates, user, password, port=22):
     """
     更新远程主机上指定路径的gflags.conf文件配置。

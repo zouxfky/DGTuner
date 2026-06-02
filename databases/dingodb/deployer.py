@@ -2,6 +2,8 @@ import json
 import subprocess
 
 from databases.dingodb.config_deployer import (
+    update_docker_config_option_dict,
+    update_docker_yaml_config_dict,
     update_config_option_dict,
     update_remote_config_option_dict,
     update_remote_yaml_config_dict,
@@ -134,6 +136,60 @@ def runtime_server_info(runtime_config):
     }]
 
 
+def docker_role_targets(config_apply):
+    default_targets = {
+        "coordinator": [{
+            "container": "coordinator1",
+            "yaml": "/opt/dingo-store/dist/coordinator1/conf/coordinator.yaml",
+            "gflags": "/opt/dingo-store/dist/coordinator1/conf/gflags.conf",
+        }, {
+            "container": "coordinator2",
+            "yaml": "/opt/dingo-store/dist/coordinator1/conf/coordinator.yaml",
+            "gflags": "/opt/dingo-store/dist/coordinator1/conf/gflags.conf",
+        }, {
+            "container": "coordinator3",
+            "yaml": "/opt/dingo-store/dist/coordinator1/conf/coordinator.yaml",
+            "gflags": "/opt/dingo-store/dist/coordinator1/conf/gflags.conf",
+        }],
+        "store": [{
+            "container": "store1",
+            "yaml": "/opt/dingo-store/dist/store1/conf/store.yaml",
+            "gflags": "/opt/dingo-store/dist/store1/conf/gflags.conf",
+        }, {
+            "container": "store2",
+            "yaml": "/opt/dingo-store/dist/store1/conf/store.yaml",
+            "gflags": "/opt/dingo-store/dist/store1/conf/gflags.conf",
+        }, {
+            "container": "store3",
+            "yaml": "/opt/dingo-store/dist/store1/conf/store.yaml",
+            "gflags": "/opt/dingo-store/dist/store1/conf/gflags.conf",
+        }],
+        "index": [{
+            "container": "index1",
+            "yaml": "/opt/dingo-store/dist/index1/conf/index.yaml",
+            "gflags": "/opt/dingo-store/dist/index1/conf/gflags.conf",
+        }, {
+            "container": "index2",
+            "yaml": "/opt/dingo-store/dist/index1/conf/index.yaml",
+            "gflags": "/opt/dingo-store/dist/index1/conf/gflags.conf",
+        }, {
+            "container": "index3",
+            "yaml": "/opt/dingo-store/dist/index1/conf/index.yaml",
+            "gflags": "/opt/dingo-store/dist/index1/conf/gflags.conf",
+        }],
+    }
+    return (config_apply.get("docker") or {}).get("roles") or default_targets
+
+
+def apply_docker_runtime_config(config_apply, yaml_params, gflags_params):
+    role_targets = docker_role_targets(config_apply)
+    for role in ROLE_NAMES:
+        for target in role_targets.get(role, []):
+            container = target["container"]
+            update_docker_yaml_config_dict(container, target["yaml"], yaml_params[role])
+            update_docker_config_option_dict(container, target["gflags"], gflags_params[role])
+
+
 def apply_runtime_config(runtime_config, yaml_params, gflags_params, flat_params):
     config_apply = runtime_config.get("config_apply") or {}
     method = config_apply.get("method", "direct")
@@ -147,6 +203,10 @@ def apply_runtime_config(runtime_config, yaml_params, gflags_params, flat_params
             gflags_params["coordinator"],
             runtime_server_info(runtime_config),
         )
+        return
+
+    if method == "docker":
+        apply_docker_runtime_config(config_apply, yaml_params, gflags_params)
         return
 
     if method == "script":

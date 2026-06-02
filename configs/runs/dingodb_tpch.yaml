@@ -1,0 +1,4 @@
+database: "dingodb"
+workload: "tpch"
+scale_factor: "0.1"
+database_runtime: "databases/dingodb/runtime.yaml"

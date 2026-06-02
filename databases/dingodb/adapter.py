@@ -78,6 +78,17 @@ class DingoDBAdapter(DatabaseAdapter):
 
         if "choices" in value_range:
             choices = list(value_range["choices"])
+            if param_type in {"bool", "boolean"}:
+                if isinstance(value, str):
+                    return value.lower() in {"true", "on", "yes", "1"}
+                if isinstance(value, bool):
+                    return value
+                index = int(round(float(value)))
+                index = max(0, min(len(choices) - 1, index))
+                choice = choices[index]
+                if isinstance(choice, str):
+                    return choice.lower() in {"true", "on", "yes", "1"}
+                return bool(choice)
             if isinstance(value, str) and value in choices:
                 return value
             index = int(round(float(value)))
@@ -134,6 +145,9 @@ class DingoDBAdapter(DatabaseAdapter):
     def apply_config(self, params):
         yaml_params, gflags_params = self._group_config_params(params)
         apply_runtime_config(self.runtime_config, yaml_params, gflags_params, self.get_true_values(params))
+
+    def restart(self):
+        return self.db_controller.restart()
 
     def clear_output_log(self):
         if os.path.exists(OUTPUT_LOG):

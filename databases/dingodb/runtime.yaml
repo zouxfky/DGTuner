@@ -1,40 +1,76 @@
-database:
-  name: "dingodb"
+# Local Docker runtime. Most users only need to change host_ip if auto-detection
+# chooses the wrong non-loopback address.
+docker_runtime:
+  host_ip: "auto"
+  compose_file: "docker-compose.yml"
+  containers:
+    - "coordinator1"
+    - "coordinator2"
+    - "coordinator3"
+    - "store1"
+    - "store2"
+    - "store3"
+    - "index1"
+    - "index2"
+    - "index3"
+    - "executor"
+    - "proxy"
 
 workload_client:
   protocol: "mysql"
-  binary: "mysql"
-  host: "192.168.60.132"
+  mode: "docker"
+  image: "mysql:5.7"
+  network: "host"
+  host: "127.0.0.1"
   port: 3307
   user: "root"
   password: "123123"
   timeout_seconds: 1800
 
 ssh:
-  enabled: true
-  host: "192.168.60.135"
-  port: 22
-  user: "root"
-  password: "admin123"
+  enabled: false
 
 lifecycle:
   enabled: true
-  start: "docker start coordinator store index executor"
-  start_check: "docker inspect -f '{{.State.Running}}' coordinator 2>/dev/null | grep -q true && docker inspect -f '{{.State.Running}}' store 2>/dev/null | grep -q true && docker inspect -f '{{.State.Running}}' index 2>/dev/null | grep -q true && docker inspect -f '{{.State.Running}}' executor 2>/dev/null | grep -q true && mysql -h 127.0.0.1 -P 3307 -u root -p123123 -e 'show databases;' >/dev/null 2>&1 && echo ok || echo 'not ok'"
-  stop: "docker stop executor index store coordinator"
-  stop_check: "docker inspect -f '{{.State.Running}}' coordinator 2>/dev/null | grep -q true || docker inspect -f '{{.State.Running}}' store 2>/dev/null | grep -q true || docker inspect -f '{{.State.Running}}' index 2>/dev/null | grep -q true || docker inspect -f '{{.State.Running}}' executor 2>/dev/null | grep -q true && echo 'not ok' || echo ok"
-  clear_log: "for c in coordinator store index executor; do log=$(docker inspect -f '{{.LogPath}}' $c 2>/dev/null); [ -n \"$log\" ] && sudo truncate -s 0 \"$log\" || true; done"
+  start: "python3 -m databases.dingodb.docker_runtime start"
+  start_check: "python3 -m databases.dingodb.docker_runtime check"
+  stop: "python3 -m databases.dingodb.docker_runtime stop"
+  stop_check: "python3 -m databases.dingodb.docker_runtime stop-check"
+  clear_log: "python3 -m databases.dingodb.docker_runtime clear-log"
   max_retries: 120
   max_minutes: 7
 
 config_apply:
-  method: "direct"
-  yaml:
-    store: "/root/Dingo/singlenode/store/store1.yaml"
-    index: "/root/Dingo/singlenode/index/index1.yaml"
-    coordinator: "/root/Dingo/singlenode/coordinator/coordinator1.yaml"
-  gflags:
-    store: "/root/Dingo/singlenode/store/gflags1.conf"
-    index: "/root/Dingo/singlenode/index/gflags1.conf"
-    coordinator: "/root/Dingo/singlenode/coordinator/gflags1.conf"
-  script: ""
+  method: "docker"
+  docker:
+    roles:
+      coordinator:
+        - container: "coordinator1"
+          yaml: "/opt/dingo-store/dist/coordinator1/conf/coordinator.yaml"
+          gflags: "/opt/dingo-store/dist/coordinator1/conf/gflags.conf"
+        - container: "coordinator2"
+          yaml: "/opt/dingo-store/dist/coordinator1/conf/coordinator.yaml"
+          gflags: "/opt/dingo-store/dist/coordinator1/conf/gflags.conf"
+        - container: "coordinator3"
+          yaml: "/opt/dingo-store/dist/coordinator1/conf/coordinator.yaml"
+          gflags: "/opt/dingo-store/dist/coordinator1/conf/gflags.conf"
+      store:
+        - container: "store1"
+          yaml: "/opt/dingo-store/dist/store1/conf/store.yaml"
+          gflags: "/opt/dingo-store/dist/store1/conf/gflags.conf"
+        - container: "store2"
+          yaml: "/opt/dingo-store/dist/store1/conf/store.yaml"
+          gflags: "/opt/dingo-store/dist/store1/conf/gflags.conf"
+        - container: "store3"
+          yaml: "/opt/dingo-store/dist/store1/conf/store.yaml"
+          gflags: "/opt/dingo-store/dist/store1/conf/gflags.conf"
+      index:
+        - container: "index1"
+          yaml: "/opt/dingo-store/dist/index1/conf/index.yaml"
+          gflags: "/opt/dingo-store/dist/index1/conf/gflags.conf"
+        - container: "index2"
+          yaml: "/opt/dingo-store/dist/index1/conf/index.yaml"
+          gflags: "/opt/dingo-store/dist/index1/conf/gflags.conf"
+        - container: "index3"
+          yaml: "/opt/dingo-store/dist/index1/conf/index.yaml"
+          gflags: "/opt/dingo-store/dist/index1/conf/gflags.conf"

@@ -6,9 +6,17 @@ from dgtuner.llm_prior.client import call_llm
 from dgtuner.llm_prior.config import llm_config
 from dgtuner.llm_prior.io import load_text, read_jsonl, write_jsonl
 from dgtuner.common.paths import database_knowledge_paths, llm_pruning_path
-from dgtuner.llm_prior.paths import DEFAULT_CONTEXT_PATH, DEFAULT_DATABASE, DEFAULT_OUTPUT_PATH, DEFAULT_PARAMETERS_PATH
+from dgtuner.llm_prior.paths import DEFAULT_DATABASE
 from dgtuner.llm_prior.prompt import build_prompt, parameter_id
 from dgtuner.llm_prior.response import normalize_response
+
+
+def runtime_run_paths(database):
+    if database != "dingodb":
+        return None
+    from dgtuner.run_config import resolve_run_config
+
+    return resolve_run_config()
 
 
 def chunked(items, chunk_size):
@@ -75,10 +83,16 @@ def main():
     parser.add_argument("--llm-j", type=int, default=1)
     args = parser.parse_args()
 
-    default_parameters, default_context = database_knowledge_paths(args.database)
+    default_parameters = database_knowledge_paths(args.database)
+    run_paths = runtime_run_paths(args.database)
     parameters_path = args.parameters or str(default_parameters)
-    context_path = args.context or str(default_context)
-    output_path = args.output or str(llm_pruning_path(args.database))
+    if args.context:
+        context_path = args.context
+    elif run_paths:
+        context_path = str(run_paths["context"])
+    else:
+        raise ValueError("Missing --context. No workload context can be inferred without a runtime benchmark config.")
+    output_path = args.output or str(run_paths["llm_pruning"] if run_paths else llm_pruning_path(args.database))
     result = run_pruning(
         parameters_path=parameters_path,
         context_path=context_path,
