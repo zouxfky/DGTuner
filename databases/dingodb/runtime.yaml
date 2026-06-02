@@ -1,0 +1,40 @@
+database:
+  name: "dingodb"
+
+workload_client:
+  protocol: "mysql"
+  binary: "mysql"
+  host: "192.168.60.132"
+  port: 3307
+  user: "root"
+  password: "123123"
+  timeout_seconds: 1800
+
+ssh:
+  enabled: true
+  host: "192.168.60.135"
+  port: 22
+  user: "root"
+  password: "admin123"
+
+lifecycle:
+  enabled: true
+  start: "docker start coordinator store index executor"
+  start_check: "docker inspect -f '{{.State.Running}}' coordinator 2>/dev/null | grep -q true && docker inspect -f '{{.State.Running}}' store 2>/dev/null | grep -q true && docker inspect -f '{{.State.Running}}' index 2>/dev/null | grep -q true && docker inspect -f '{{.State.Running}}' executor 2>/dev/null | grep -q true && mysql -h 127.0.0.1 -P 3307 -u root -p123123 -e 'show databases;' >/dev/null 2>&1 && echo ok || echo 'not ok'"
+  stop: "docker stop executor index store coordinator"
+  stop_check: "docker inspect -f '{{.State.Running}}' coordinator 2>/dev/null | grep -q true || docker inspect -f '{{.State.Running}}' store 2>/dev/null | grep -q true || docker inspect -f '{{.State.Running}}' index 2>/dev/null | grep -q true || docker inspect -f '{{.State.Running}}' executor 2>/dev/null | grep -q true && echo 'not ok' || echo ok"
+  clear_log: "for c in coordinator store index executor; do log=$(docker inspect -f '{{.LogPath}}' $c 2>/dev/null); [ -n \"$log\" ] && sudo truncate -s 0 \"$log\" || true; done"
+  max_retries: 120
+  max_minutes: 7
+
+config_apply:
+  method: "direct"
+  yaml:
+    store: "/root/Dingo/singlenode/store/store1.yaml"
+    index: "/root/Dingo/singlenode/index/index1.yaml"
+    coordinator: "/root/Dingo/singlenode/coordinator/coordinator1.yaml"
+  gflags:
+    store: "/root/Dingo/singlenode/store/gflags1.conf"
+    index: "/root/Dingo/singlenode/index/gflags1.conf"
+    coordinator: "/root/Dingo/singlenode/coordinator/gflags1.conf"
+  script: ""
