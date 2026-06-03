@@ -3,3 +3,4 @@ configs/llm.env
 __pycache__/
 *.pyc
 legacy/
+.venv/

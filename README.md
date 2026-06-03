@@ -80,7 +80,7 @@ Prepare and run the TPC-H workload for DingoDB:
 
 ```bash
 python3 workload/tpch/prepare_dingodb.py --config configs/runs/dingodb_tpch.yaml
-python3 -m dgtuner.run 2 --config configs/runs/dingodb_tpch.yaml --initial-samples 5 --batch-size 5 --max-samples 30 --stable-rounds 2 --concurrency 10
+python3 -m dgtuner.run 2 --config configs/runs/dingodb_tpch.yaml --samples 30 --workload-repeats 2 --keep-top-k 12 --concurrency 10
 ```
 
 `prepare_dingodb.py` checks the configured TPC-H data directory automatically.

@@ -14,13 +14,13 @@ from dgtuner.common.paths import (
 )
 from dgtuner.probing.analysis import (
     normalize_query_info,
-    rank_parameters_by_sparse_effect,
-    rank_sql_by_sensitivity,
+    select_reduced_sql_by_rank_correlation,
 )
+from dgtuner.probing.importance import rank_parameters_by_importance
 from dgtuner.probing.io import read_jsonl, split_sql_file, write_jsonl, write_sql_file
 from dgtuner.probing.sampling import (
     default_sample_value,
-    generate_sparse_screening_samples,
+    generate_sobol_samples,
     normalize_range,
     parameter_id,
     parameter_key,
@@ -161,63 +161,20 @@ def remap_probe_sql_ids(query_info, initial_sql):
         item["sql"] = original_sql_id_by_probe_id.get(item["probe_sql"], item["sql"])
 
 
-def run_samples(adapter, planned_samples, sample_range, workload_path, concurrency, initial_sql, repeats, baseline_time):
+def run_samples(adapter, planned_samples, workload_path, concurrency, initial_sql, repeats, baseline_time):
     sample_results = []
-    for sample_id in sample_range:
-        sample_entry = planned_samples[sample_id]
-        sample = sample_entry.get("params", sample_entry) if isinstance(sample_entry, dict) else sample_entry
+    for sample_id, sample_entry in enumerate(planned_samples):
+        sample = sample_entry["params"]
         run_result = apply_and_run(adapter, sample, workload_path, concurrency, repeats, baseline_time)
         remap_probe_sql_ids(run_result["query_info"], initial_sql)
-        record = {
+        sample_results.append({
             "record_type": "sample_result",
             "sample_id": sample_id,
             "workload_repeats": repeats,
             "params": sample,
             **run_result,
-        }
-        if isinstance(sample_entry, dict) and "params" in sample_entry:
-            for key in ("varied_parameters", "screening_sample_index", "parameter_coverage"):
-                if key in sample_entry:
-                    record[key] = sample_entry[key]
-        sample_results.append(record)
+        })
     return sample_results
-
-
-def run_sparse_screening(adapter, parameters, initial_sql, workload_path, settings, baseline_result):
-    planned_samples = generate_sparse_screening_samples(
-        parameters,
-        settings["max_samples"],
-        active_parameters_per_sample=settings["active_parameters_per_sample"],
-        seed=settings["seed"],
-    )
-    sample_results = run_samples(
-        adapter,
-        planned_samples,
-        range(len(planned_samples)),
-        workload_path,
-        settings["concurrency"],
-        initial_sql,
-        settings["workload_repeats"],
-        baseline_result["total_time"],
-    )
-    sql_decisions = rank_sql_by_sensitivity(
-        initial_sql,
-        sample_results,
-        settings["keep_sql_ratio"],
-        settings["min_sql"],
-        baseline_result["query_info"],
-    )
-    parameter_decisions = rank_parameters_by_sparse_effect(
-        parameters,
-        sample_results,
-        settings["knob_effect_threshold"],
-        settings["elite_ratio"],
-        ridge_alpha=settings["ridge_alpha"],
-        bootstrap_rounds=settings["bootstrap_rounds"],
-        selection_prob_threshold=settings["selection_probability_threshold"],
-        seed=settings["seed"],
-    )
-    return sample_results, sql_decisions, parameter_decisions
 
 
 def run_probing(
@@ -226,21 +183,19 @@ def run_probing(
     workload_path,
     output_path,
     reduced_workload_path,
-    max_samples,
+    samples,
     concurrency,
     adapter_options,
     similarity_threshold,
     initial_sql_percent,
-    keep_sql_ratio,
+    keep_top_k,
+    importance_threshold,
+    bagging_rounds,
+    sql_corr_threshold,
     min_sql,
-    elite_ratio,
+    max_sql,
     workload_repeats,
     baseline_repeats,
-    active_parameters_per_sample,
-    ridge_alpha,
-    bootstrap_rounds,
-    selection_probability_threshold,
-    knob_effect_threshold,
     seed,
 ):
     adapter = create_adapter(database, adapter_options)
@@ -252,20 +207,18 @@ def run_probing(
     statements = split_sql_file(workload_path)
     initial_sql, sql_groups = select_initial_sql(statements, similarity_threshold, initial_sql_percent)
     settings = {
-        "max_samples": max_samples,
+        "samples": samples,
         "concurrency": concurrency,
         "similarity_threshold": similarity_threshold,
         "initial_sql_percent": initial_sql_percent,
-        "keep_sql_ratio": keep_sql_ratio,
+        "keep_top_k": keep_top_k,
+        "importance_threshold": importance_threshold,
+        "bagging_rounds": bagging_rounds,
+        "sql_corr_threshold": sql_corr_threshold,
         "min_sql": min_sql,
-        "elite_ratio": elite_ratio,
+        "max_sql": max_sql,
         "workload_repeats": workload_repeats,
         "baseline_repeats": baseline_repeats,
-        "active_parameters_per_sample": active_parameters_per_sample,
-        "ridge_alpha": ridge_alpha,
-        "bootstrap_rounds": bootstrap_rounds,
-        "selection_probability_threshold": selection_probability_threshold,
-        "knob_effect_threshold": knob_effect_threshold,
         "seed": seed,
     }
 
@@ -291,16 +244,34 @@ def run_probing(
             "repeat_times": baseline_workload["repeat_times"],
             "query_info": baseline_workload["query_info"],
         }
-        sample_results, sql_decisions, parameter_decisions = run_sparse_screening(
+        planned_samples = generate_sobol_samples(parameters, samples, seed=seed)
+        sample_results = run_samples(
             adapter,
-            parameters,
-            initial_sql,
+            planned_samples,
             temp_workload_path,
-            settings,
-            baseline_result,
+            concurrency,
+            initial_sql,
+            workload_repeats,
+            baseline_result["total_time"],
         )
     finally:
         temp_workload_path.unlink(missing_ok=True)
+
+    parameter_decisions = rank_parameters_by_importance(
+        parameters,
+        sample_results,
+        keep_top_k=keep_top_k,
+        importance_threshold=importance_threshold,
+        bagging_rounds=bagging_rounds,
+        seed=seed,
+    )
+    sql_decisions = select_reduced_sql_by_rank_correlation(
+        initial_sql,
+        sample_results,
+        keep_threshold=sql_corr_threshold,
+        min_sql=min_sql,
+        max_sql=max_sql,
+    )
 
     kept_sql = [item["sql"] for item in sql_decisions if item["keep"] == 1]
     write_sql_file(reduced_workload_path, kept_sql)
@@ -343,27 +314,25 @@ def run_probing(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run adaptive empirical probing for Stage 2.")
+    parser = argparse.ArgumentParser(description="Run empirical probing for Stage 2 (knob and SQL reduction).")
     parser.add_argument("--database", default=DEFAULT_DATABASE)
     parser.add_argument("--llm-pruning", default=None)
     parser.add_argument("--workload", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--reduced-workload", default=None)
-    parser.add_argument("--max-samples", type=int, default=30)
+    parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--adapter-option", action="append", default=[])
     parser.add_argument("--similarity-threshold", type=float, default=0.9)
     parser.add_argument("--initial-sql-percent", type=float, default=10.0)
-    parser.add_argument("--keep-sql-ratio", type=float, default=0.6)
+    parser.add_argument("--keep-top-k", type=int, default=12)
+    parser.add_argument("--importance-threshold", type=float, default=0.0)
+    parser.add_argument("--bagging-rounds", type=int, default=5)
+    parser.add_argument("--sql-corr-threshold", type=float, default=0.95)
     parser.add_argument("--min-sql", type=int, default=1)
-    parser.add_argument("--elite-ratio", type=float, default=0.2)
-    parser.add_argument("--workload-repeats", type=int, default=3)
-    parser.add_argument("--baseline-repeats", type=int, default=3)
-    parser.add_argument("--active-parameters-per-sample", type=int, default=8)
-    parser.add_argument("--ridge-alpha", type=float, default=1.0)
-    parser.add_argument("--bootstrap-rounds", type=int, default=30)
-    parser.add_argument("--selection-probability-threshold", type=float, default=0.6)
-    parser.add_argument("--knob-effect-threshold", type=float, default=0.02)
+    parser.add_argument("--max-sql", type=int, default=None)
+    parser.add_argument("--workload-repeats", type=int, default=2)
+    parser.add_argument("--baseline-repeats", type=int, default=2)
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
 
@@ -377,21 +346,19 @@ def main():
         workload_path=workload,
         output_path=output,
         reduced_workload_path=reduced_workload,
-        max_samples=args.max_samples,
+        samples=args.samples,
         concurrency=args.concurrency,
         adapter_options=parse_adapter_options(args.adapter_option),
         similarity_threshold=args.similarity_threshold,
         initial_sql_percent=args.initial_sql_percent,
-        keep_sql_ratio=args.keep_sql_ratio,
+        keep_top_k=args.keep_top_k,
+        importance_threshold=args.importance_threshold,
+        bagging_rounds=args.bagging_rounds,
+        sql_corr_threshold=args.sql_corr_threshold,
         min_sql=args.min_sql,
-        elite_ratio=args.elite_ratio,
+        max_sql=args.max_sql,
         workload_repeats=args.workload_repeats,
         baseline_repeats=args.baseline_repeats,
-        active_parameters_per_sample=args.active_parameters_per_sample,
-        ridge_alpha=args.ridge_alpha,
-        bootstrap_rounds=args.bootstrap_rounds,
-        selection_probability_threshold=args.selection_probability_threshold,
-        knob_effect_threshold=args.knob_effect_threshold,
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
