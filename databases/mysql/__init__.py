@@ -1,5 +1,1 @@
-"""MySQL adapter package placeholder.
-
-Only the DingoDB adapter is implemented currently.
-"""
-
+"""MySQL adapter package."""

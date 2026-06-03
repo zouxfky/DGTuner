@@ -66,6 +66,7 @@ class DBController:
         self.ssh_user = ssh.get("user")
         self.ssh_password = ssh.get("password")
         self.start_command = self._resolve_command(lifecycle.get("start"), config_path)
+        self.restart_command = self._resolve_command(lifecycle.get("restart"), config_path)
         self.start_check_command = self._resolve_command(lifecycle.get("start_check"), config_path)
         self.stop_command = self._resolve_command(lifecycle.get("stop"), config_path)
         self.stop_check_command = self._resolve_command(lifecycle.get("stop_check"), config_path)
@@ -127,6 +128,8 @@ class DBController:
 
     def restart(self):
         """Restart the managed database runtime."""
+        if self.restart_command:
+            return self._execute_script(self.restart_command)
         stop_stdout, stop_stderr = self.stop()
         start_stdout, start_stderr = self.start()
         return stop_stdout + start_stdout, stop_stderr + start_stderr

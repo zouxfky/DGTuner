@@ -1,0 +1,23 @@
+# Local MySQL runtime. Users normally edit only mysql_runtime.container and
+# workload_client connection settings.
+mysql_runtime:
+  container: "mysql-dgtuner"
+  config_path: "/etc/mysql/conf.d/dgtuner.cnf"
+
+workload_client:
+  protocol: "mysql"
+  mode: "docker"
+  image: "mysql:8.0"
+  network: "host"
+  host: "127.0.0.1"
+  port: 13308
+  user: "root"
+  password: "dgtuner123"
+  database: "tpch"
+  timeout_seconds: 1800
+
+lifecycle:
+  enabled: true
+  max_retries: 120
+  max_minutes: 5
+  stop_enabled: false

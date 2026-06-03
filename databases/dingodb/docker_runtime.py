@@ -3,6 +3,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from databases.dingodb.controller import load_simple_yaml
@@ -82,11 +83,41 @@ def compose_command(runtime, runtime_path, action):
 def compose_env(runtime):
     env = os.environ.copy()
     env["DINGO_HOST_IP"] = host_ip(runtime)
+    heap = docker_runtime_config(runtime).get("executor_heap") or {}
+    env["DINGO_EXECUTOR_XMS"] = str(heap.get("xms", "32g"))
+    env["DINGO_EXECUTOR_XMX"] = str(heap.get("xmx", "32g"))
+    env["DINGO_EXECUTOR_SOFT_MAX_HEAP"] = str(heap.get("soft_max", heap.get("xmx", "32g")))
+    env["DINGO_EXECUTOR_MAX_DIRECT_MEMORY"] = str(heap.get("max_direct_memory", "4096m"))
     return env
 
 
 def container_names(runtime):
     return list(docker_runtime_config(runtime).get("containers") or DEFAULT_CONTAINERS)
+
+
+def restart_config(runtime):
+    return runtime.get("restart") or {}
+
+
+def restart_container_names(runtime):
+    configured = restart_config(runtime).get("containers")
+    if configured:
+        return list(configured)
+    return [
+        "coordinator1",
+        "coordinator2",
+        "coordinator3",
+        "store1",
+        "store2",
+        "store3",
+        "index1",
+        "index2",
+        "index3",
+    ]
+
+
+def ensure_running_container_names(runtime):
+    return list(restart_config(runtime).get("ensure_running") or ["executor", "proxy"])
 
 
 def workload_client(runtime):
@@ -139,6 +170,25 @@ def stop(runtime, runtime_path):
     return result.returncode
 
 
+def restart(runtime, runtime_path):
+    containers = restart_container_names(runtime)
+    if containers:
+        result = run(["docker", "restart", *containers], check=False)
+        if result.returncode != 0:
+            return result.returncode
+
+    settle_seconds = int(restart_config(runtime).get("settle_seconds", 5))
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+
+    for container in ensure_running_container_names(runtime):
+        if not is_running(container):
+            result = run(["docker", "start", container], check=False)
+            if result.returncode != 0:
+                return result.returncode
+    return 0
+
+
 def check(runtime):
     if not all(is_running(container) for container in container_names(runtime)):
         print("not ok")
@@ -175,7 +225,7 @@ def clear_log(runtime):
 
 def main():
     parser = argparse.ArgumentParser(description="Manage the local Docker DingoDB runtime.")
-    parser.add_argument("action", choices=["start", "stop", "check", "stop-check", "clear-log", "host-ip"])
+    parser.add_argument("action", choices=["start", "restart", "stop", "check", "stop-check", "clear-log", "host-ip"])
     parser.add_argument("--runtime", default=str(Path(__file__).resolve().parent / "runtime.yaml"))
     args = parser.parse_args()
 
@@ -183,6 +233,8 @@ def main():
     runtime = load_runtime(runtime_path)
     if args.action == "start":
         return start(runtime, runtime_path)
+    if args.action == "restart":
+        return restart(runtime, runtime_path)
     if args.action == "stop":
         return stop(runtime, runtime_path)
     if args.action == "check":

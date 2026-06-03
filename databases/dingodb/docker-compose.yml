@@ -146,6 +146,7 @@ services:
     image: dingodatabase/dingo:latest
     hostname: executor
     container_name: executor
+    restart: on-failure:5
     ports:
       - 8765:8765
       - 3307:3307
@@ -156,11 +157,18 @@ services:
        DINGO_HOSTNAME: executor
        DINGO_COORDINATORS: ${DINGO_HOST_IP}:22001,${DINGO_HOST_IP}:22002,${DINGO_HOST_IP}:22003
        DINGO_MYSQL_COORDINATORS: ${DINGO_HOST_IP}:22001
+       DINGO_EXECUTOR_XMS: ${DINGO_EXECUTOR_XMS:-32g}
+       DINGO_EXECUTOR_XMX: ${DINGO_EXECUTOR_XMX:-32g}
+       DINGO_EXECUTOR_SOFT_MAX_HEAP: ${DINGO_EXECUTOR_SOFT_MAX_HEAP:-32g}
+       DINGO_EXECUTOR_MAX_DIRECT_MEMORY: ${DINGO_EXECUTOR_MAX_DIRECT_MEMORY:-4096m}
+    volumes:
+      - ./docker/start-executor.sh:/opt/dingo/bin/start-executor.sh:ro
 
   proxy:
     image: dingodatabase/dingo:latest
     hostname: proxy
     container_name: proxy
+    restart: on-failure:5
     ports:
       - 13000:13000
       - 9999:9999

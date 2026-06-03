@@ -39,6 +39,7 @@ def run_stage1(run, args):
 def run_stage2(run, args):
     from dgtuner.probing.runner import main
 
+    adapter_args = ["--adapter-option", f"runtime_config_path={run['database_runtime']}"]
     sys.argv = [
         "dgtuner.probing",
         "--database",
@@ -51,6 +52,7 @@ def run_stage2(run, args):
         str(run["probing"]),
         "--reduced-workload",
         str(run["reduced_workload"]),
+        *adapter_args,
         *args,
     ]
     main()
@@ -59,6 +61,7 @@ def run_stage2(run, args):
 def run_stage3(run, args):
     from dgtuner.bo.runner import main
 
+    adapter_args = ["--adapter-option", f"runtime_config_path={run['database_runtime']}"]
     sys.argv = [
         "dgtuner.bo",
         "--database",
@@ -69,6 +72,7 @@ def run_stage3(run, args):
         str(run["bo"]),
         "--workload",
         str(run["reduced_workload"]),
+        *adapter_args,
         *args,
     ]
     main()

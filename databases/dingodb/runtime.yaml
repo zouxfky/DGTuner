@@ -3,6 +3,11 @@
 docker_runtime:
   host_ip: "auto"
   compose_file: "docker-compose.yml"
+  executor_heap:
+    xms: "32g"
+    xmx: "32g"
+    soft_max: "32g"
+    max_direct_memory: "4096m"
   containers:
     - "coordinator1"
     - "coordinator2"
@@ -33,12 +38,29 @@ ssh:
 lifecycle:
   enabled: true
   start: "python3 -m databases.dingodb.docker_runtime start"
+  restart: "python3 -m databases.dingodb.docker_runtime restart"
   start_check: "python3 -m databases.dingodb.docker_runtime check"
   stop: "python3 -m databases.dingodb.docker_runtime stop"
   stop_check: "python3 -m databases.dingodb.docker_runtime stop-check"
   clear_log: "python3 -m databases.dingodb.docker_runtime clear-log"
   max_retries: 120
   max_minutes: 7
+
+restart:
+  containers:
+    - "coordinator1"
+    - "coordinator2"
+    - "coordinator3"
+    - "store1"
+    - "store2"
+    - "store3"
+    - "index1"
+    - "index2"
+    - "index3"
+  ensure_running:
+    - "executor"
+    - "proxy"
+  settle_seconds: 5
 
 config_apply:
   method: "docker"

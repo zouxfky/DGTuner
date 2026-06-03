@@ -1,6 +1,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+from pathlib import Path
 
 from dgtuner.llm_prior.client import call_llm
 from dgtuner.llm_prior.config import llm_config
@@ -12,11 +13,13 @@ from dgtuner.llm_prior.response import normalize_response
 
 
 def runtime_run_paths(database):
-    if database != "dingodb":
-        return None
     from dgtuner.run_config import resolve_run_config
+    from dgtuner.common.paths import PROJECT_ROOT
 
-    return resolve_run_config()
+    config_path = PROJECT_ROOT / "configs" / "runs" / f"{database}_tpch.yaml"
+    if not config_path.exists():
+        return None
+    return resolve_run_config(config_path)
 
 
 def chunked(items, chunk_size):
@@ -24,17 +27,55 @@ def chunked(items, chunk_size):
         yield items[start:start + chunk_size]
 
 
+def load_existing_decisions(output_path, parameter_ids):
+    path = Path(output_path)
+    if not path.exists():
+        return {}
+    decisions = {}
+    valid_ids = set(parameter_ids)
+    for record in read_jsonl(path):
+        param_id = parameter_id(record)
+        if param_id in valid_ids and "keep" in record and record.get("reason"):
+            decisions[param_id] = {
+                "keep": int(record.get("keep", 1)),
+                "reason": record.get("reason", ""),
+            }
+    return decisions
+
+
+def build_records(parameters, decisions):
+    records = []
+    for record in parameters:
+        param_id = parameter_id(record)
+        decision = decisions.get(param_id, {
+            "keep": 1,
+            "reason": "Pending LLM decision; keep conservatively until this chunk completes.",
+        })
+        output_record = dict(record)
+        output_record["keep"] = decision["keep"]
+        output_record["reason"] = decision["reason"]
+        records.append(output_record)
+    return records
+
+
+def flush_records(output_path, parameters, decisions):
+    write_jsonl(output_path, build_records(parameters, decisions))
+
+
 def run_pruning(parameters_path, context_path, output_path, params_per_prompt, llm_j):
     parameters = read_jsonl(parameters_path)
     context = load_text(context_path)
     config = llm_config()
-    chunks = list(chunked(parameters, params_per_prompt))
+    parameter_ids = [parameter_id(record) for record in parameters]
+    decisions = load_existing_decisions(output_path, parameter_ids)
+    pending_parameters = [record for record in parameters if parameter_id(record) not in decisions]
+    chunks = list(chunked(pending_parameters, params_per_prompt))
+    flush_records(output_path, parameters, decisions)
 
     def run_chunk(index, chunk):
         response = call_llm(build_prompt(context, chunk), config)
         return index, normalize_response(response)
 
-    decisions = {}
     workers = max(1, int(llm_j))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -44,29 +85,25 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
         for future in as_completed(futures):
             _, chunk_decisions = future.result()
             decisions.update(chunk_decisions)
+            flush_records(output_path, parameters, decisions)
 
-    records = []
-    for record in parameters:
-        param_id = parameter_id(record)
-        decision = decisions.get(param_id, {
-            "keep": 1,
-            "reason": "No LLM decision found; keep conservatively.",
-        })
-        output_record = dict(record)
-        output_record["keep"] = decision["keep"]
-        output_record["reason"] = decision["reason"]
-        records.append(output_record)
-
-    write_jsonl(output_path, records)
+    records = build_records(parameters, decisions)
     keep_count = sum(1 for record in records if record["keep"] == 1)
     remove_count = sum(1 for record in records if record["keep"] == 0)
+    completed_count = sum(
+        1
+        for record in records
+        if record.get("reason") != "Pending LLM decision; keep conservatively until this chunk completes."
+    )
     return {
         "output": str(output_path),
         "candidate_count": len(records),
+        "completed_count": completed_count,
         "keep_count": keep_count,
         "remove_count": remove_count,
         "params_per_prompt": params_per_prompt,
         "prompt_count": len(chunks),
+        "resumed_count": len(parameters) - len(pending_parameters),
         "llm_j": workers,
         "model": config["model"],
         "api_base_url": config["api_base_url"],

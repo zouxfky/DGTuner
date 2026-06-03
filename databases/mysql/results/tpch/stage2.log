@@ -1,0 +1,20 @@
+nohup: ignoring input
+{
+  "record_type": "summary",
+  "database": "mysql",
+  "llm_parameter_count": 103,
+  "sampled_parameter_count": 103,
+  "skipped_parameter_count": 0,
+  "sample_count": 30,
+  "round_count": 6,
+  "stop_reason": "max_samples",
+  "baseline_time": 3.967676877975464,
+  "original_sql_count": 22,
+  "similarity_group_count": 22,
+  "initial_sql_count": 22,
+  "kept_sql_count": 14,
+  "kept_parameter_count": 22,
+  "removed_parameter_count": 81,
+  "output": "/remote-home2/zxf/DGTuner/databases/mysql/results/tpch/2/probing.jsonl",
+  "reduced_workload": "/remote-home2/zxf/DGTuner/databases/mysql/results/tpch/2/reduced_workload.sql"
+}

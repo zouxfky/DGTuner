@@ -71,6 +71,8 @@ class BOStage:
         self.iteration += 1
         applied_params = normalize_params(self.adapter, params)
         self.adapter.apply_config(params)
+        if hasattr(self.adapter, "restart"):
+            self.adapter.restart()
         self.adapter.clear_output_log()
         target = self.adapter.run_workload_target(self.workload_path, self.concurrency, self.mode)
         record = {

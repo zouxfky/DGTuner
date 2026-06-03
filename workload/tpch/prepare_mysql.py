@@ -9,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from databases.dingodb.controller import load_simple_yaml
+from databases.mysql.controller import mysql_client_args
 from dgtuner.run_config import DEFAULT_RUN_CONFIG, resolve_run_config, scale_to_dirname
 
 
@@ -105,9 +106,7 @@ def ensure_dbgen():
     if executable.exists():
         return executable
     if not DBGEN_DIR.exists():
-        raise FileNotFoundError(
-            f"Missing {DBGEN_DIR}. Clone TPC-H dbgen source there before preparing data."
-        )
+        raise FileNotFoundError(f"Missing {DBGEN_DIR}. Clone/build TPC-H dbgen before preparing data.")
     run(["make", "MACHINE=LINUX", "DATABASE=MYSQL", "dbgen"], cwd=DBGEN_DIR)
     if not executable.exists():
         raise FileNotFoundError(f"dbgen build did not create {executable}")
@@ -116,10 +115,9 @@ def ensure_dbgen():
 
 def generate_data(scale, data_dir):
     data_dir.mkdir(parents=True, exist_ok=True)
-    dists_source = DBGEN_DIR / "dists.dss"
     dists_target = data_dir / "dists.dss"
     if not dists_target.exists():
-        shutil.copyfile(dists_source, dists_target)
+        shutil.copyfile(DBGEN_DIR / "dists.dss", dists_target)
     run([ensure_dbgen(), "-s", str(scale), "-f"], cwd=data_dir)
 
 
@@ -127,57 +125,25 @@ def missing_table_files(data_dir):
     return [data_dir / f"{table}.tbl" for table in TABLES if not (data_dir / f"{table}.tbl").exists()]
 
 
-def mysql_args(runtime_path, sql=None, sql_file=None, volume=None, local_infile=False):
-    config = load_simple_yaml(str(runtime_path))
-    client = config.get("workload_client") or config.get("sql_client")
+def load_client(runtime_path):
+    runtime = load_simple_yaml(str(runtime_path))
+    client = runtime.get("workload_client") or runtime.get("sql_client")
     if not client:
         raise ValueError(f"Missing workload_client in {runtime_path}")
-
-    if client.get("mode") == "docker":
-        command = [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            str(client.get("network", "host")),
-        ]
-        if volume:
-            command.extend(["-v", volume])
-        command.extend([str(client.get("image", "mysql:5.7")), "mysql"])
-    else:
-        command = [str(client.get("binary", "mysql"))]
-
-    if local_infile:
-        command.append("--local-infile=1")
-    command.extend(
-        [
-            "-h",
-            str(client["host"]),
-            "-P",
-            str(client["port"]),
-            "-u",
-            str(client["user"]),
-            f"-p{client['password']}",
-        ]
-    )
-    if sql is not None:
-        command.extend(["-e", sql])
-    if sql_file is not None:
-        command.extend(["-e", f"source {sql_file}"])
-    return command
+    return client
 
 
-def apply_schema(runtime_path, schema_path):
-    run(
-        mysql_args(
-            runtime_path,
-            sql_file=f"/schema/{schema_path.name}",
-            volume=f"{schema_path.parent.resolve()}:/schema:ro",
-        )
-    )
+def apply_schema(client, schema_path):
+    schema_client = dict(client)
+    schema_client.pop("database", None)
+    run(mysql_client_args(
+        schema_client,
+        sql_file=f"/schema/{schema_path.name}",
+        volume=f"{schema_path.parent.resolve()}:/schema:ro",
+    ))
 
 
-def load_tables(runtime_path, data_dir):
+def load_tables(client, data_dir):
     mount = f"{data_dir.resolve()}:/data:ro"
     for table in TABLES:
         columns = ", ".join(LOAD_COLUMNS[table])
@@ -186,45 +152,25 @@ def load_tables(runtime_path, data_dir):
             "FIELDS TERMINATED BY '|' "
             f"({columns}, @unused);"
         )
-        run(mysql_args(runtime_path, sql=sql, volume=mount, local_infile=True))
+        run(mysql_client_args(client, sql=sql, volume=mount, local_infile=True))
 
 
-def smoke_test(runtime_path):
+def smoke_test(client):
     selects = [
         f"SELECT '{table}' AS table_name, COUNT(*) AS row_count FROM {table}"
         for table in TABLES
     ]
-    run(mysql_args(runtime_path, sql=" UNION ALL ".join(selects) + ";"))
+    run(mysql_client_args(client, sql=" UNION ALL ".join(selects) + ";"))
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Generate and load TPC-H data into DingoDB.")
-    parser.add_argument(
-        "--config",
-        default=str(DEFAULT_RUN_CONFIG),
-        help="Run config path. Defaults to configs/runs/dingodb_tpch.yaml.",
-    )
-    parser.add_argument(
-        "--runtime",
-        default=None,
-        help="Optional database runtime override. Defaults to database_runtime in the run config.",
-    )
-    parser.add_argument(
-        "--scale",
-        default=None,
-        help="TPC-H scale factor. Defaults to scale_factor in the run config.",
-    )
-    parser.add_argument(
-        "--schema",
-        default=None,
-        help="Schema SQL file. Defaults to workload/<workload>/schema/<database>.sql.",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default=None,
-        help="Output directory for .tbl files. Defaults to workload/<workload>/data/sf<scale>.",
-    )
-    parser.add_argument("--skip-load", action="store_true", help="Generate data only; do not create/load DingoDB tables")
+    parser = argparse.ArgumentParser(description="Generate and load TPC-H data into MySQL.")
+    parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "runs" / "mysql_tpch.yaml"))
+    parser.add_argument("--runtime", default=None)
+    parser.add_argument("--scale", default=None)
+    parser.add_argument("--schema", default=None)
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--skip-load", action="store_true", help="Generate data only; do not create/load MySQL tables")
     return parser.parse_args()
 
 
@@ -249,9 +195,10 @@ def main():
         raise FileNotFoundError("Missing generated TPC-H files: " + ", ".join(missing))
 
     if not args.skip_load:
-        apply_schema(runtime_path, schema_path)
-        load_tables(runtime_path, data_dir)
-        smoke_test(runtime_path)
+        client = load_client(runtime_path)
+        apply_schema(client, schema_path)
+        load_tables(client, data_dir)
+        smoke_test(client)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 import argparse
 import json
+import math
 from pathlib import Path
+import statistics
 import tempfile
 
 from databases.factory import create_database_adapter
 from dgtuner.common.paths import (
-    PROJECT_ROOT,
     default_workload_path,
     llm_pruning_path,
     probing_path,
@@ -13,12 +14,17 @@ from dgtuner.common.paths import (
 )
 from dgtuner.probing.analysis import (
     normalize_query_info,
-    rank_parameters_by_correlation,
+    rank_parameters_by_sparse_effect,
     rank_sql_by_sensitivity,
-    stability_status,
 )
 from dgtuner.probing.io import read_jsonl, split_sql_file, write_jsonl, write_sql_file
-from dgtuner.probing.sampling import generate_lhs_samples, normalize_range, parameter_id, parameter_key
+from dgtuner.probing.sampling import (
+    default_sample_value,
+    generate_sparse_screening_samples,
+    normalize_range,
+    parameter_id,
+    parameter_key,
+)
 from dgtuner.probing.workload import select_initial_sql
 
 
@@ -78,18 +84,62 @@ def create_adapter(database, adapter_options):
     return create_database_adapter(database, **adapter_options)
 
 
-def apply_and_run(adapter, sample, workload_path, concurrency):
+def aggregate_repeated_workload(repeat_results):
+    total_times = [float(item["total_time"]) for item in repeat_results]
+    per_sql = {}
+    for repeat in repeat_results:
+        for item in repeat["query_info"]:
+            bucket = per_sql.setdefault(int(item["sql"]), {"times": [], "status": 0})
+            bucket["times"].append(float(item["execution_time"]))
+            if int(item.get("status", 0)) != 0:
+                bucket["status"] = 1
+    query_info = [
+        {
+            "sql": sql_id,
+            "status": data["status"],
+            "execution_time": float(statistics.median(data["times"])) if data["times"] else 0.0,
+        }
+        for sql_id, data in sorted(per_sql.items())
+    ]
+    return {
+        "total_time": float(sum(item["execution_time"] for item in query_info)),
+        "repeat_times": total_times,
+        "query_info": query_info,
+    }
+
+
+def run_workload_repeats(adapter, workload_path, concurrency, repeats):
+    repeat_results = []
+    for repeat_id in range(max(1, int(repeats))):
+        total_time, query_info = adapter.run_workload_with_query_info(str(workload_path), concurrency)
+        repeat_results.append({
+            "repeat": repeat_id + 1,
+            "total_time": float(total_time),
+            "query_info": normalize_query_info(query_info),
+        })
+    return aggregate_repeated_workload(repeat_results)
+
+
+def default_parameter_sample(parameters):
+    return {parameter_key(record): default_sample_value(record) for record in parameters}
+
+
+def apply_and_run(adapter, sample, workload_path, concurrency, repeats, baseline_time):
     applied = adapter.get_true_values(sample) if hasattr(adapter, "get_true_values") else sample
     adapter.apply_config(sample)
     if hasattr(adapter, "restart"):
         adapter.restart()
     adapter.clear_output_log()
-    total_time, query_info = adapter.run_workload_with_query_info(str(workload_path), concurrency)
+    workload_result = run_workload_repeats(adapter, workload_path, concurrency, repeats)
+    total_time = float(workload_result["total_time"])
+    baseline_time = max(float(baseline_time), 1e-9)
     return {
         "applied_params": applied,
-        "total_time": float(total_time),
-        "target": -float(total_time) if abs(float(total_time)) >= 1 else -999,
-        "query_info": normalize_query_info(query_info),
+        "total_time": total_time,
+        "baseline_time": baseline_time,
+        "target": -math.log(max(total_time, 1e-9) / baseline_time),
+        "repeat_times": workload_result["repeat_times"],
+        "query_info": workload_result["query_info"],
     }
 
 
@@ -111,104 +161,63 @@ def remap_probe_sql_ids(query_info, initial_sql):
         item["sql"] = original_sql_id_by_probe_id.get(item["probe_sql"], item["sql"])
 
 
-def run_samples(adapter, planned_samples, sample_range, workload_path, concurrency, initial_sql):
+def run_samples(adapter, planned_samples, sample_range, workload_path, concurrency, initial_sql, repeats, baseline_time):
     sample_results = []
     for sample_id in sample_range:
-        sample = planned_samples[sample_id]
-        run_result = apply_and_run(adapter, sample, workload_path, concurrency)
+        sample_entry = planned_samples[sample_id]
+        sample = sample_entry.get("params", sample_entry) if isinstance(sample_entry, dict) else sample_entry
+        run_result = apply_and_run(adapter, sample, workload_path, concurrency, repeats, baseline_time)
         remap_probe_sql_ids(run_result["query_info"], initial_sql)
-        sample_results.append({
+        record = {
             "record_type": "sample_result",
             "sample_id": sample_id,
+            "workload_repeats": repeats,
             "params": sample,
             **run_result,
-        })
+        }
+        if isinstance(sample_entry, dict) and "params" in sample_entry:
+            for key in ("varied_parameters", "screening_sample_index", "parameter_coverage"):
+                if key in sample_entry:
+                    record[key] = sample_entry[key]
+        sample_results.append(record)
     return sample_results
 
 
-def build_round_summary(round_id, previous_sample_count, current_sample_count, sql_decisions, parameter_decisions, stability, stable_count):
-    return {
-        "record_type": "round_summary",
-        "round": round_id,
-        "sample_count": current_sample_count,
-        "new_sample_count": current_sample_count - previous_sample_count,
-        "kept_sql_count": sum(1 for item in sql_decisions if item["keep"] == 1),
-        "kept_parameter_count": sum(1 for item in parameter_decisions if item["keep"] == 1),
-        "removed_parameter_count": sum(1 for item in parameter_decisions if item["keep"] == 0),
-        "stable": stability["stable"],
-        "consecutive_stable_rounds": stable_count,
-        "sql_jaccard": stability["sql_jaccard"],
-        "knob_jaccard": stability["knob_jaccard"],
-        "rank_jaccard": stability["rank_jaccard"],
-    }
-
-
-def run_adaptive_rounds(adapter, parameters, initial_sql, planned_samples, workload_path, settings):
-    sample_results = []
-    round_summaries = []
-    sql_decisions = []
-    parameter_decisions = []
-    previous_stability_base = None
-    stable_count = 0
-    stop_reason = "max_samples"
-    next_sample_id = 0
-    round_id = 0
-
-    while next_sample_id < len(planned_samples):
-        round_id += 1
-        previous_sample_count = next_sample_id
-        target_sample_count = (
-            min(settings["initial_samples"], len(planned_samples))
-            if next_sample_id == 0
-            else min(next_sample_id + settings["batch_size"], len(planned_samples))
-        )
-
-        sample_results.extend(run_samples(
-            adapter,
-            planned_samples,
-            range(next_sample_id, target_sample_count),
-            workload_path,
-            settings["concurrency"],
-            initial_sql,
-        ))
-        next_sample_id = target_sample_count
-
-        cumulative_samples = planned_samples[:next_sample_id]
-        sql_decisions = rank_sql_by_sensitivity(initial_sql, sample_results, settings["keep_sql_ratio"], settings["min_sql"])
-        parameter_decisions = rank_parameters_by_correlation(
-            parameters,
-            cumulative_samples,
-            sample_results,
-            settings["knob_correlation_threshold"],
-            settings["elite_ratio"],
-        )
-        previous_stability_base, stability = stability_status(
-            previous_stability_base,
-            sql_decisions,
-            parameter_decisions,
-            {
-                "sql": settings["sql_stability_threshold"],
-                "knob": settings["knob_stability_threshold"],
-                "rank": settings["rank_stability_threshold"],
-            },
-            settings["top_k_knobs"],
-        )
-        stable_count = stable_count + 1 if stability["stable"] else 0
-        round_summaries.append(build_round_summary(
-            round_id,
-            previous_sample_count,
-            next_sample_id,
-            sql_decisions,
-            parameter_decisions,
-            stability,
-            stable_count,
-        ))
-
-        if stable_count >= settings["stable_rounds"]:
-            stop_reason = "stable"
-            break
-
-    return sample_results, round_summaries, sql_decisions, parameter_decisions, stop_reason
+def run_sparse_screening(adapter, parameters, initial_sql, workload_path, settings, baseline_result):
+    planned_samples = generate_sparse_screening_samples(
+        parameters,
+        settings["max_samples"],
+        active_parameters_per_sample=settings["active_parameters_per_sample"],
+        seed=settings["seed"],
+    )
+    sample_results = run_samples(
+        adapter,
+        planned_samples,
+        range(len(planned_samples)),
+        workload_path,
+        settings["concurrency"],
+        initial_sql,
+        settings["workload_repeats"],
+        baseline_result["total_time"],
+    )
+    sql_decisions = rank_sql_by_sensitivity(
+        initial_sql,
+        sample_results,
+        settings["keep_sql_ratio"],
+        settings["min_sql"],
+        baseline_result["query_info"],
+    )
+    parameter_decisions = rank_parameters_by_sparse_effect(
+        parameters,
+        sample_results,
+        settings["knob_effect_threshold"],
+        settings["elite_ratio"],
+        ridge_alpha=settings["ridge_alpha"],
+        bootstrap_rounds=settings["bootstrap_rounds"],
+        selection_prob_threshold=settings["selection_probability_threshold"],
+        seed=settings["seed"],
+    )
+    return sample_results, sql_decisions, parameter_decisions
 
 
 def run_probing(
@@ -217,61 +226,78 @@ def run_probing(
     workload_path,
     output_path,
     reduced_workload_path,
-    initial_samples,
-    batch_size,
     max_samples,
-    stable_rounds,
     concurrency,
     adapter_options,
     similarity_threshold,
     initial_sql_percent,
     keep_sql_ratio,
     min_sql,
-    knob_correlation_threshold,
     elite_ratio,
-    sql_stability_threshold,
-    knob_stability_threshold,
-    rank_stability_threshold,
-    top_k_knobs,
+    workload_repeats,
+    baseline_repeats,
+    active_parameters_per_sample,
+    ridge_alpha,
+    bootstrap_rounds,
+    selection_probability_threshold,
+    knob_effect_threshold,
     seed,
 ):
     adapter = create_adapter(database, adapter_options)
     llm_parameters = load_kept_parameters(llm_pruning_path)
     parameters, no_range_parameters = filter_tunable_parameters(llm_parameters)
-    planned_samples = generate_lhs_samples(parameters, max_samples, seed=seed)
-    if not planned_samples:
+    if not parameters:
         raise ValueError("No tunable parameters remain for probing.")
 
     statements = split_sql_file(workload_path)
     initial_sql, sql_groups = select_initial_sql(statements, similarity_threshold, initial_sql_percent)
     settings = {
-        "initial_samples": initial_samples,
-        "batch_size": batch_size,
         "max_samples": max_samples,
-        "stable_rounds": stable_rounds,
         "concurrency": concurrency,
         "similarity_threshold": similarity_threshold,
         "initial_sql_percent": initial_sql_percent,
         "keep_sql_ratio": keep_sql_ratio,
         "min_sql": min_sql,
-        "knob_correlation_threshold": knob_correlation_threshold,
         "elite_ratio": elite_ratio,
-        "sql_stability_threshold": sql_stability_threshold,
-        "knob_stability_threshold": knob_stability_threshold,
-        "rank_stability_threshold": rank_stability_threshold,
-        "top_k_knobs": top_k_knobs,
+        "workload_repeats": workload_repeats,
+        "baseline_repeats": baseline_repeats,
+        "active_parameters_per_sample": active_parameters_per_sample,
+        "ridge_alpha": ridge_alpha,
+        "bootstrap_rounds": bootstrap_rounds,
+        "selection_probability_threshold": selection_probability_threshold,
+        "knob_effect_threshold": knob_effect_threshold,
         "seed": seed,
     }
 
     temp_workload_path = probing_temp_workload(initial_sql)
     try:
-        sample_results, round_summaries, sql_decisions, parameter_decisions, stop_reason = run_adaptive_rounds(
+        default_sample = default_parameter_sample(parameters)
+        baseline_applied = adapter.get_true_values(default_sample) if hasattr(adapter, "get_true_values") else default_sample
+        adapter.apply_config(default_sample)
+        if hasattr(adapter, "restart"):
+            adapter.restart()
+        adapter.clear_output_log()
+        baseline_workload = run_workload_repeats(adapter, temp_workload_path, concurrency, baseline_repeats)
+        remap_probe_sql_ids(baseline_workload["query_info"], initial_sql)
+        baseline_result = {
+            "record_type": "baseline_result",
+            "sample_id": "baseline",
+            "params": default_sample,
+            "applied_params": baseline_applied,
+            "total_time": baseline_workload["total_time"],
+            "baseline_time": baseline_workload["total_time"],
+            "target": 0.0,
+            "workload_repeats": baseline_repeats,
+            "repeat_times": baseline_workload["repeat_times"],
+            "query_info": baseline_workload["query_info"],
+        }
+        sample_results, sql_decisions, parameter_decisions = run_sparse_screening(
             adapter,
             parameters,
             initial_sql,
-            planned_samples,
             temp_workload_path,
             settings,
+            baseline_result,
         )
     finally:
         temp_workload_path.unlink(missing_ok=True)
@@ -286,8 +312,8 @@ def run_probing(
         "sampled_parameter_count": len(parameters),
         "skipped_parameter_count": len(no_range_parameters),
         "sample_count": len(sample_results),
-        "round_count": len(round_summaries),
-        "stop_reason": stop_reason,
+        "stop_reason": "fixed_sample_count_completed",
+        "baseline_time": baseline_result["total_time"],
         "original_sql_count": len(statements),
         "similarity_group_count": len(sql_groups),
         "initial_sql_count": len(initial_sql),
@@ -307,8 +333,8 @@ def run_probing(
         "settings": settings,
     }]
     records.extend({"record_type": "skipped_parameter", **item} for item in no_range_parameters)
+    records.append(baseline_result)
     records.extend(sample_results)
-    records.extend(round_summaries)
     records.extend(sql_decisions)
     records.extend(parameter_decisions)
     records.append(summary)
@@ -323,22 +349,21 @@ def main():
     parser.add_argument("--workload", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--reduced-workload", default=None)
-    parser.add_argument("--initial-samples", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--max-samples", type=int, default=30)
-    parser.add_argument("--stable-rounds", type=int, default=2)
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--adapter-option", action="append", default=[])
     parser.add_argument("--similarity-threshold", type=float, default=0.9)
     parser.add_argument("--initial-sql-percent", type=float, default=10.0)
     parser.add_argument("--keep-sql-ratio", type=float, default=0.6)
     parser.add_argument("--min-sql", type=int, default=1)
-    parser.add_argument("--knob-correlation-threshold", type=float, default=0.05)
     parser.add_argument("--elite-ratio", type=float, default=0.2)
-    parser.add_argument("--sql-stability-threshold", type=float, default=0.9)
-    parser.add_argument("--knob-stability-threshold", type=float, default=0.9)
-    parser.add_argument("--rank-stability-threshold", type=float, default=0.8)
-    parser.add_argument("--top-k-knobs", type=int, default=10)
+    parser.add_argument("--workload-repeats", type=int, default=3)
+    parser.add_argument("--baseline-repeats", type=int, default=3)
+    parser.add_argument("--active-parameters-per-sample", type=int, default=8)
+    parser.add_argument("--ridge-alpha", type=float, default=1.0)
+    parser.add_argument("--bootstrap-rounds", type=int, default=30)
+    parser.add_argument("--selection-probability-threshold", type=float, default=0.6)
+    parser.add_argument("--knob-effect-threshold", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
 
@@ -352,22 +377,25 @@ def main():
         workload_path=workload,
         output_path=output,
         reduced_workload_path=reduced_workload,
-        initial_samples=args.initial_samples,
-        batch_size=args.batch_size,
         max_samples=args.max_samples,
-        stable_rounds=args.stable_rounds,
         concurrency=args.concurrency,
         adapter_options=parse_adapter_options(args.adapter_option),
         similarity_threshold=args.similarity_threshold,
         initial_sql_percent=args.initial_sql_percent,
         keep_sql_ratio=args.keep_sql_ratio,
         min_sql=args.min_sql,
-        knob_correlation_threshold=args.knob_correlation_threshold,
         elite_ratio=args.elite_ratio,
-        sql_stability_threshold=args.sql_stability_threshold,
-        knob_stability_threshold=args.knob_stability_threshold,
-        rank_stability_threshold=args.rank_stability_threshold,
-        top_k_knobs=args.top_k_knobs,
+        workload_repeats=args.workload_repeats,
+        baseline_repeats=args.baseline_repeats,
+        active_parameters_per_sample=args.active_parameters_per_sample,
+        ridge_alpha=args.ridge_alpha,
+        bootstrap_rounds=args.bootstrap_rounds,
+        selection_probability_threshold=args.selection_probability_threshold,
+        knob_effect_threshold=args.knob_effect_threshold,
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

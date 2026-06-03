@@ -10,7 +10,9 @@ client path differs.
 - `all.sql`: concatenated single-file form for current DGTuner runners.
 - `context.md`: user-written workload description used by Stage 1.
 - `schema/dingodb.sql`: DingoDB-compatible TPC-H schema.
+- `schema/mysql.sql`: MySQL-compatible TPC-H schema.
 - `prepare_dingodb.py`: generate data with dbgen and load it into DingoDB.
+- `prepare_mysql.py`: generate data with dbgen and load it into MySQL.
 - `build_all.py`: regenerate `all.sql` from the 22 query files.
 - `data/`: generated `.tbl` files, ignored by git.
 - `dbgen/`: local TPC-H dbgen source/build tree, ignored by git.
@@ -35,4 +37,17 @@ set. Use `workload/tpch/all.sql` when a runner expects a single SQL file.
 
 ```bash
 python3 workload/tpch/build_all.py
+```
+
+## MySQL
+
+MySQL uses the same workload directory and result layout. Users normally edit
+`databases/mysql/runtime.yaml` for the MySQL container name, host, port, user,
+password, and database name, then use `configs/runs/mysql_tpch.yaml`.
+
+```bash
+python3 workload/tpch/prepare_mysql.py --config configs/runs/mysql_tpch.yaml
+python3 -m dgtuner.run 1 --config configs/runs/mysql_tpch.yaml --params-per-prompt 10 --llm-j 5
+python3 -m dgtuner.run 2 --config configs/runs/mysql_tpch.yaml --initial-samples 5 --batch-size 5 --max-samples 30 --stable-rounds 2 --concurrency 10
+python3 -m dgtuner.run 3 --config configs/runs/mysql_tpch.yaml --iterations 50 --init-points 5 --concurrency 10
 ```
