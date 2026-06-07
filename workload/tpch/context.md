@@ -7,7 +7,7 @@
 - Dominant pattern: relational analytical workload with scans, joins, filters, grouping, aggregation, ordering, limits, subqueries, semi-joins, anti-joins, and date/range predicates.
 - Query templates cover a broad range of decision-support access patterns rather than one repeated lookup pattern.
 - The workload is read-heavy during performance evaluation; data loading is a separate preparation step and is not part of the tuning workload.
-- The scale factor, data location, and concrete SQL file layout are runtime configuration details and should not affect the general workload characterization.
+- The scale factor, data location, and concrete SQL file layout are runtime configuration details and do not affect the general workload characterization.
 
 ## Tables
 
@@ -20,12 +20,15 @@
 ## Objective
 
 - Primary objective: minimize total TPC-H workload execution time.
-- Throughput can be considered only insofar as it helps reduce total workload execution time under the tested concurrency.
+- Throughput is considered only insofar as it reduces total workload execution time under the tested concurrency.
 - The tuning target is read-heavy analytical query execution.
 
-## Expected Relevance Bias
+## Execution Characteristics
 
-- Read path worker and queue parameters are likely relevant.
-- Storage/cache/background-thread parameters can be relevant because TPC-H uses scans, joins, and aggregations over larger relational tables.
-- RocksDB/cache/compaction-related settings may matter if they affect read latency, scan performance, or memory pressure.
-- Request scheduling, service worker, scan execution, cache sizing, memory reclamation, and storage background maintenance parameters are natural candidates for relevance when their official descriptions connect them to read throughput or latency.
+- Reads large volumes of data through sequential and range scans over large tables.
+- Performs many large multi-table joins that depend on the memory available for intermediate join processing.
+- Sorts and groups large intermediate results for `ORDER BY`, `GROUP BY`, and aggregation.
+- Benefits from keeping frequently accessed data and indexes resident in memory.
+- Exploits parallel and concurrent query execution at the tested concurrency.
+- Is read-dominated during evaluation; write, durability, replication, and logging activity do not contribute to query execution time.
+- Is sensitive to background maintenance work only where it affects read latency.
