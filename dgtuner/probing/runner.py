@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import statistics
 import tempfile
+import time
 
 from databases.factory import create_database_adapter
 from dgtuner.common.paths import (
@@ -163,8 +164,10 @@ def remap_probe_sql_ids(query_info, initial_sql):
 
 def run_samples(adapter, planned_samples, workload_path, concurrency, initial_sql, repeats, baseline_time):
     sample_results = []
+    total = len(planned_samples)
     for sample_id, sample_entry in enumerate(planned_samples):
         sample = sample_entry["params"]
+        start = time.time()
         run_result = apply_and_run(adapter, sample, workload_path, concurrency, repeats, baseline_time)
         remap_probe_sql_ids(run_result["query_info"], initial_sql)
         sample_results.append({
@@ -174,7 +177,17 @@ def run_samples(adapter, planned_samples, workload_path, concurrency, initial_sq
             "params": sample,
             **run_result,
         })
+        print(
+            f"[stage2] sample {sample_id + 1}/{total} done | "
+            f"total_time={run_result['total_time']:.2f}s target={run_result['target']:+.4f} | "
+            f"{time.time() - start:.1f}s",
+            flush=True,
+        )
     return sample_results
+
+
+MIN_SAMPLES = 8
+CONCURRENCY = 1
 
 
 def run_probing(
@@ -184,18 +197,15 @@ def run_probing(
     output_path,
     reduced_workload_path,
     samples,
-    concurrency,
     adapter_options,
     similarity_threshold,
     initial_sql_percent,
-    keep_top_k,
     importance_threshold,
     bagging_rounds,
     sql_corr_threshold,
     min_sql,
     max_sql,
     workload_repeats,
-    baseline_repeats,
     seed,
 ):
     adapter = create_adapter(database, adapter_options)
@@ -204,33 +214,41 @@ def run_probing(
     if not parameters:
         raise ValueError("No tunable parameters remain for probing.")
 
+    # Fixed evaluation budget, decoupled from the parameter count: Stage 2 must
+    # cost far fewer evaluations than Stage 3, so the budget is capped, not scaled.
+    samples = max(MIN_SAMPLES, int(samples))
+
     statements = split_sql_file(workload_path)
     initial_sql, sql_groups = select_initial_sql(statements, similarity_threshold, initial_sql_percent)
     settings = {
         "samples": samples,
-        "concurrency": concurrency,
         "similarity_threshold": similarity_threshold,
         "initial_sql_percent": initial_sql_percent,
-        "keep_top_k": keep_top_k,
         "importance_threshold": importance_threshold,
         "bagging_rounds": bagging_rounds,
         "sql_corr_threshold": sql_corr_threshold,
         "min_sql": min_sql,
         "max_sql": max_sql,
         "workload_repeats": workload_repeats,
-        "baseline_repeats": baseline_repeats,
         "seed": seed,
     }
+
+    print(
+        f"[stage2] {len(parameters)} tunable params | {samples} samples (budget) | "
+        f"initial_sql={len(initial_sql)}/{len(statements)} | workload_repeats={workload_repeats}",
+        flush=True,
+    )
 
     temp_workload_path = probing_temp_workload(initial_sql)
     try:
         default_sample = default_parameter_sample(parameters)
         baseline_applied = adapter.get_true_values(default_sample) if hasattr(adapter, "get_true_values") else default_sample
+        print("[stage2] running baseline (default config)...", flush=True)
         adapter.apply_config(default_sample)
         if hasattr(adapter, "restart"):
             adapter.restart()
         adapter.clear_output_log()
-        baseline_workload = run_workload_repeats(adapter, temp_workload_path, concurrency, baseline_repeats)
+        baseline_workload = run_workload_repeats(adapter, temp_workload_path, CONCURRENCY, workload_repeats)
         remap_probe_sql_ids(baseline_workload["query_info"], initial_sql)
         baseline_result = {
             "record_type": "baseline_result",
@@ -240,16 +258,17 @@ def run_probing(
             "total_time": baseline_workload["total_time"],
             "baseline_time": baseline_workload["total_time"],
             "target": 0.0,
-            "workload_repeats": baseline_repeats,
+            "workload_repeats": workload_repeats,
             "repeat_times": baseline_workload["repeat_times"],
             "query_info": baseline_workload["query_info"],
         }
+        print(f"[stage2] baseline total_time={baseline_result['total_time']:.2f}s; sampling {samples} configs...", flush=True)
         planned_samples = generate_sobol_samples(parameters, samples, seed=seed)
         sample_results = run_samples(
             adapter,
             planned_samples,
             temp_workload_path,
-            concurrency,
+            CONCURRENCY,
             initial_sql,
             workload_repeats,
             baseline_result["total_time"],
@@ -257,14 +276,16 @@ def run_probing(
     finally:
         temp_workload_path.unlink(missing_ok=True)
 
+    print("[stage2] ranking parameters (ARD-GP relevance + per-SQL recall net)...", flush=True)
     parameter_decisions = rank_parameters_by_importance(
         parameters,
         sample_results,
-        keep_top_k=keep_top_k,
+        baseline_query_info=baseline_result["query_info"],
         importance_threshold=importance_threshold,
         bagging_rounds=bagging_rounds,
         seed=seed,
     )
+    print("[stage2] selecting representative SQL (rank correlation)...", flush=True)
     sql_decisions = select_reduced_sql_by_rank_correlation(
         initial_sql,
         sample_results,
@@ -275,6 +296,12 @@ def run_probing(
 
     kept_sql = [item["sql"] for item in sql_decisions if item["keep"] == 1]
     write_sql_file(reduced_workload_path, kept_sql)
+    kept_params = sum(1 for item in parameter_decisions if item["keep"] == 1)
+    print(
+        f"[stage2] done | kept_params={kept_params}/{len(parameter_decisions)} | "
+        f"kept_sql={len(kept_sql)}/{len(initial_sql)}",
+        flush=True,
+    )
 
     summary = {
         "record_type": "summary",
@@ -283,7 +310,7 @@ def run_probing(
         "sampled_parameter_count": len(parameters),
         "skipped_parameter_count": len(no_range_parameters),
         "sample_count": len(sample_results),
-        "stop_reason": "fixed_sample_count_completed",
+        "stop_reason": "param_scaled_sampling_completed",
         "baseline_time": baseline_result["total_time"],
         "original_sql_count": len(statements),
         "similarity_group_count": len(sql_groups),
@@ -320,19 +347,17 @@ def main():
     parser.add_argument("--workload", default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--reduced-workload", default=None)
-    parser.add_argument("--samples", type=int, default=30)
-    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument("--samples", type=int, default=40,
+                        help="evaluation budget for Stage 2; keep it well below Stage 3 iterations")
     parser.add_argument("--adapter-option", action="append", default=[])
     parser.add_argument("--similarity-threshold", type=float, default=0.9)
     parser.add_argument("--initial-sql-percent", type=float, default=10.0)
-    parser.add_argument("--keep-top-k", type=int, default=12)
-    parser.add_argument("--importance-threshold", type=float, default=0.0)
+    parser.add_argument("--importance-threshold", type=float, default=0.01)
     parser.add_argument("--bagging-rounds", type=int, default=5)
     parser.add_argument("--sql-corr-threshold", type=float, default=0.95)
     parser.add_argument("--min-sql", type=int, default=1)
     parser.add_argument("--max-sql", type=int, default=None)
     parser.add_argument("--workload-repeats", type=int, default=2)
-    parser.add_argument("--baseline-repeats", type=int, default=2)
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
 
@@ -347,18 +372,15 @@ def main():
         output_path=output,
         reduced_workload_path=reduced_workload,
         samples=args.samples,
-        concurrency=args.concurrency,
         adapter_options=parse_adapter_options(args.adapter_option),
         similarity_threshold=args.similarity_threshold,
         initial_sql_percent=args.initial_sql_percent,
-        keep_top_k=args.keep_top_k,
         importance_threshold=args.importance_threshold,
         bagging_rounds=args.bagging_rounds,
         sql_corr_threshold=args.sql_corr_threshold,
         min_sql=args.min_sql,
         max_sql=args.max_sql,
         workload_repeats=args.workload_repeats,
-        baseline_repeats=args.baseline_repeats,
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
