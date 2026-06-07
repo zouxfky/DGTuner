@@ -36,11 +36,56 @@ def parameter_text(record, index):
     )
 
 
-def build_prompt(context, parameters):
+RETURN_SHAPE = (
+    "Return JSON in exactly this shape:\n"
+    "{\n"
+    '  "parameters": [\n'
+    "    {\n"
+    '      "id": "same as candidate id",\n'
+    '      "keep": 0,\n'
+    '      "reason": "short workload-specific reason"\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+)
+
+
+def build_prompt(context, parameters, refine=False):
     parameter_notes = "\n\n".join(
         parameter_text(record, index)
         for index, record in enumerate(parameters, 1)
     )
+    if refine:
+        system = (
+            "You are a database configuration tuning assistant. This is a SECOND "
+            "round of parameter pruning: every candidate already passed an initial "
+            "screen, so none is obviously irrelevant. Re-examine each one and remove "
+            "only those you are confident have merely indirect or marginal influence "
+            "on this workload. Stay conservative: when unsure, keep. Do not recommend "
+            "concrete parameter values. Do not invent parameters. Return valid JSON only."
+        )
+        user = (
+            "Task: re-examine these already-screened parameters and decide whether each "
+            "should still be kept for empirical tuning.\n\n"
+            "Rules:\n"
+            "- Output `keep = 1` if the parameter has a DIRECT effect on this workload's "
+            "execution performance, or if you cannot be sure its influence is only "
+            "indirect or marginal.\n"
+            "- Output `keep = 0` ONLY when, after careful thought, you are confident the "
+            "parameter has only indirect, marginal, or situational influence on this "
+            "workload.\n"
+            "- This is the second round, so the bar may be slightly stricter than the "
+            "first, but the conservative principle is unchanged: removing a genuinely "
+            "useful parameter is worse than keeping a marginal one. When truly unsure, keep.\n"
+            "- Prefer keeping the core classes that directly affect read-path performance: "
+            "buffer/cache, memory, parallelism/threads, scan, and optimizer-related knobs.\n\n"
+            f"Context:\n{context}\n\n"
+            "Candidate parameters:\n"
+            f"{parameter_notes}\n\n"
+            + RETURN_SHAPE
+        )
+        return {"system": system, "user": user}
+
     return {
         "system": (
             "You are a database configuration tuning assistant. "
@@ -59,15 +104,6 @@ def build_prompt(context, parameters):
             f"Context:\n{context}\n\n"
             "Candidate parameters:\n"
             f"{parameter_notes}\n\n"
-            "Return JSON in exactly this shape:\n"
-            "{\n"
-            '  "parameters": [\n'
-            "    {\n"
-            '      "id": "same as candidate id",\n'
-            '      "keep": 0,\n'
-            '      "reason": "short workload-specific reason"\n'
-            "    }\n"
-            "  ]\n"
-            "}\n"
+            + RETURN_SHAPE
         ),
     }

@@ -58,28 +58,54 @@ def build_records(parameters, decisions):
     return records
 
 
-def flush_records(output_path, parameters, decisions):
-    write_jsonl(output_path, build_records(parameters, decisions))
+def flush_records(output_path, parameters, decisions, frozen=None):
+    records = list(frozen or []) + build_records(parameters, decisions)
+    write_jsonl(output_path, records)
 
 
-def run_pruning(parameters_path, context_path, output_path, params_per_prompt, llm_j):
-    parameters = read_jsonl(parameters_path)
+def load_refine_inputs(output_path):
+    """Refine mode: re-prune only the survivors (keep==1) of a previous run.
+
+    Returns (candidates, frozen) where candidates are the survivors with their old
+    keep/reason stripped so they get re-decided fresh, and frozen are the already
+    removed records, preserved verbatim so the output file stays complete.
+    """
+    existing = read_jsonl(output_path)
+    candidates, frozen = [], []
+    for record in existing:
+        if int(record.get("keep", 1)) == 1:
+            candidates.append({k: v for k, v in record.items() if k not in ("keep", "reason")})
+        else:
+            frozen.append(record)
+    return candidates, frozen
+
+
+def run_pruning(parameters_path, context_path, output_path, params_per_prompt, llm_j, refine=False):
+    refining = refine and Path(output_path).exists()
+    if refining:
+        parameters, frozen = load_refine_inputs(output_path)
+        decisions = {}  # re-decide every survivor; do not resume
+    else:
+        parameters = read_jsonl(parameters_path)
+        frozen = []
+        parameter_ids = [parameter_id(record) for record in parameters]
+        decisions = load_existing_decisions(output_path, parameter_ids)
+
     context = load_text(context_path)
     config = llm_config()
-    parameter_ids = [parameter_id(record) for record in parameters]
-    decisions = load_existing_decisions(output_path, parameter_ids)
     pending_parameters = [record for record in parameters if parameter_id(record) not in decisions]
     chunks = list(chunked(pending_parameters, params_per_prompt))
-    flush_records(output_path, parameters, decisions)
+    flush_records(output_path, parameters, decisions, frozen)
 
     def run_chunk(index, chunk):
-        response = call_llm(build_prompt(context, chunk), config)
+        response = call_llm(build_prompt(context, chunk, refine=refining), config)
         return index, normalize_response(response)
 
     workers = max(1, int(llm_j))
     total_chunks = len(chunks)
+    mode = "refine (survivors only)" if refining else "full"
     print(
-        f"[stage1] {len(parameters)} params | {len(pending_parameters)} pending | "
+        f"[stage1] {mode} | {len(parameters)} params | {len(pending_parameters)} pending | "
         f"{total_chunks} chunks x {params_per_prompt} | {workers} workers | model={config['model']}",
         flush=True,
     )
@@ -101,7 +127,7 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
                 print(f"[stage1] chunk {completed}/{total_chunks} (#{index + 1}) FAILED: {error}", flush=True)
                 continue
             decisions.update(chunk_decisions)
-            flush_records(output_path, parameters, decisions)
+            flush_records(output_path, parameters, decisions, frozen)
             kept = sum(1 for decision in decisions.values() if decision["keep"] == 1)
             removed = sum(1 for decision in decisions.values() if decision["keep"] == 0)
             print(
@@ -110,7 +136,7 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
                 flush=True,
             )
 
-    records = build_records(parameters, decisions)
+    records = list(frozen) + build_records(parameters, decisions)
     keep_count = sum(1 for record in records if record["keep"] == 1)
     remove_count = sum(1 for record in records if record["keep"] == 0)
     completed_count = sum(
@@ -120,6 +146,7 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
     )
     return {
         "output": str(output_path),
+        "mode": "refine" if refining else "full",
         "candidate_count": len(records),
         "completed_count": completed_count,
         "keep_count": keep_count,
@@ -127,6 +154,7 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
         "params_per_prompt": params_per_prompt,
         "prompt_count": len(chunks),
         "resumed_count": len(parameters) - len(pending_parameters),
+        "frozen_removed_count": len(frozen),
         "llm_j": workers,
         "model": config["model"],
         "api_base_url": config["api_base_url"],
@@ -141,6 +169,8 @@ def main():
     parser.add_argument("--output", default=None)
     parser.add_argument("--params-per-prompt", type=int, default=10)
     parser.add_argument("--llm-j", type=int, default=1)
+    parser.add_argument("--refine", action="store_true",
+                        help="re-prune only the survivors of an existing output file, in place")
     args = parser.parse_args()
 
     default_parameters = database_knowledge_paths(args.database)
@@ -159,5 +189,6 @@ def main():
         output_path=output_path,
         params_per_prompt=args.params_per_prompt,
         llm_j=args.llm_j,
+        refine=args.refine,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))

@@ -34,10 +34,14 @@ def configure_query_timeouts(caps_by_index):
 
 def _is_query_timeout(error):
     code = error.args[0] if getattr(error, "args", None) else None
-    if code == _MYSQL_QUERY_TIMEOUT_ERRNO:
+    if code in (_MYSQL_QUERY_TIMEOUT_ERRNO, 1317):  # 3024 timeout, 1317 interrupted
         return True
     text = str(error).lower()
-    return "max_execution_time" in text or "maximum statement execution time" in text
+    return (
+        "max_execution_time" in text
+        or "maximum statement execution time" in text
+        or "execution was interrupted" in text
+    )
 
 
 def _require_client():
@@ -128,18 +132,20 @@ def execute_sqlfile_with_info_python(filepath):
                         "sql": index,
                     })
                 except Exception as error:
-                    if _is_query_timeout(error):
-                        # censored at the cap: a real, informative "this config made
-                        # this query at least cap-slow" signal, not a hard failure.
+                    elapsed = float(time.time() - start)
+                    # robust censor detection: a cap was set and the query died at/near
+                    # it (don't depend on the exact driver error code/message).
+                    censored = bool(cap) and (elapsed >= 0.9 * cap or _is_query_timeout(error))
+                    if censored:
                         execution_info.append({
                             "status_code": QUERY_TIMEOUT_STATUS,
-                            "execution_time": float(cap) if cap else float(time.time() - start),
+                            "execution_time": float(cap),
                             "sql": index,
                         })
                     else:
                         execution_info.append({
                             "status_code": 1,
-                            "execution_time": float(time.time() - start),
+                            "execution_time": elapsed,
                             "sql": index,
                         })
         return execution_info
