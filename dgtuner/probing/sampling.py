@@ -1,3 +1,5 @@
+import warnings
+
 from scipy.stats import qmc
 
 
@@ -95,7 +97,11 @@ def generate_sobol_samples(parameters, n_samples, seed=2026):
     upper = [value_range["high"] for value_range in ranges]
 
     sampler = qmc.Sobol(d=len(tunable), scramble=True, seed=seed)
-    unit_samples = sampler.random(max(1, int(n_samples)))
+    # a non-power-of-2 sample count only weakens Sobol's balance guarantee slightly,
+    # which is irrelevant for coarse screening; silence the benign scipy warning.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        unit_samples = sampler.random(max(1, int(n_samples)))
     scaled = qmc.scale(unit_samples, lower, upper)
 
     samples = []
