@@ -1,6 +1,8 @@
 import math
+import warnings
 
 import numpy as np
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 
@@ -17,6 +19,10 @@ from dgtuner.probing.sampling import (
 # least this share of the baseline total runtime (ignore effects on tiny queries).
 SQL_WEIGHT_FLOOR = 0.05
 MIN_GP_ROWS = 8
+# Recall-net gate: the per-SQL length-scale must be small enough that the surrogate
+# genuinely bends along that knob over the [0,1] domain (real signal, not a noisy
+# selection on a near-flat dimension). length-scale >~ a few = effectively flat.
+RECALL_LENGTHSCALE_MAX = 2.0
 
 
 def normalized_feature(record, value):
@@ -103,7 +109,11 @@ def fit_ard_lengthscales(matrix, targets, seed):
         n_restarts_optimizer=3,
         random_state=seed,
     )
-    model.fit(matrix, targets)
+    # length-scales pinned to the bounds are the expected screening signal
+    # (upper bound = flat = irrelevant), not an error worth surfacing.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=ConvergenceWarning)
+        model.fit(matrix, targets)
     length_scale = np.atleast_1d(model.kernel_.k1.k2.length_scale).astype(float)
     if length_scale.size == 1:
         length_scale = np.full(feature_count, float(length_scale[0]))
@@ -146,7 +156,7 @@ def aggregate_relevance(matrix, targets, selection_threshold, bagging_rounds, se
 
 
 def per_sql_selection(matrix, sample_results, baseline_query_info, selection_threshold, bagging_rounds, seed):
-    """Run ARD relevance per heavy SQL; return [(sql_id, weight, frequency[])]."""
+    """Run ARD relevance per heavy SQL; return [(sql_id, weight, frequency[], lengthscale[])]."""
     if baseline_query_info is None:
         return []
     sql_targets = per_sql_log_ratio_targets(sample_results, baseline_query_info)
@@ -162,10 +172,10 @@ def per_sql_selection(matrix, sample_results, baseline_query_info, selection_thr
         sub_x, sub_y = matrix[mask], y[mask]
         if float(np.ptp(sub_y)) <= 0.0:
             continue
-        _, _, frequency = aggregate_relevance(
+        _, mean_lengthscale, frequency = aggregate_relevance(
             sub_x, sub_y, selection_threshold, bagging_rounds, seed + 1000 * (offset + 1)
         )
-        selections.append((int(sql_id), float(weight), frequency))
+        selections.append((int(sql_id), float(weight), frequency, mean_lengthscale))
     return selections
 
 
@@ -219,8 +229,14 @@ def rank_parameters_by_importance(
         relevance_tag = str(record.get("relevance", "")).strip().lower()
         protected = relevance_tag == "high"
 
-        # per-SQL recall net: kept if it stably drives any heavy enough query
-        driving_sql = [sql_id for sql_id, _weight, freq in sql_selections if freq[index] >= 0.5]
+        # per-SQL recall net: kept only if it stably drives a heavy query AND the
+        # per-SQL surrogate genuinely bends along it (short length-scale), so a
+        # near-flat dimension cannot sneak back in on a noisy per-query selection.
+        driving_sql = [
+            sql_id
+            for sql_id, _weight, freq, lengthscale in sql_selections
+            if freq[index] >= 0.5 and lengthscale[index] <= RECALL_LENGTHSCALE_MAX
+        ]
         keep_total = usable and total_frequency >= 0.5
         keep_sql = bool(driving_sql)
         keep = 1 if (keep_total or keep_sql or protected) else 0
