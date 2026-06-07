@@ -77,15 +77,38 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
         return index, normalize_response(response)
 
     workers = max(1, int(llm_j))
+    total_chunks = len(chunks)
+    print(
+        f"[stage1] {len(parameters)} params | {len(pending_parameters)} pending | "
+        f"{total_chunks} chunks x {params_per_prompt} | {workers} workers | model={config['model']}",
+        flush=True,
+    )
+    if total_chunks == 0:
+        print("[stage1] nothing pending; all decisions resumed from existing output", flush=True)
+
+    completed = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
             executor.submit(run_chunk, index, chunk): index
             for index, chunk in enumerate(chunks)
         }
         for future in as_completed(futures):
-            _, chunk_decisions = future.result()
+            index = futures[future]
+            completed += 1
+            try:
+                _, chunk_decisions = future.result()
+            except Exception as error:
+                print(f"[stage1] chunk {completed}/{total_chunks} (#{index + 1}) FAILED: {error}", flush=True)
+                continue
             decisions.update(chunk_decisions)
             flush_records(output_path, parameters, decisions)
+            kept = sum(1 for decision in decisions.values() if decision["keep"] == 1)
+            removed = sum(1 for decision in decisions.values() if decision["keep"] == 0)
+            print(
+                f"[stage1] chunk {completed}/{total_chunks} done | decided={len(decisions)} "
+                f"keep={kept} remove={removed}",
+                flush=True,
+            )
 
     records = build_records(parameters, decisions)
     keep_count = sum(1 for record in records if record["keep"] == 1)
