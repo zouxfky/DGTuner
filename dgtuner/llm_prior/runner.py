@@ -104,7 +104,8 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
     config = llm_config()
     pending_parameters = [record for record in parameters if parameter_id(record) not in decisions]
     chunks = list(chunked(pending_parameters, params_per_prompt))
-    flush_records(output_path, parameters, decisions, frozen)
+    # Do not pre-write the output: the file is only touched after a chunk actually
+    # returns a result, so a failed run (or failed prefix) leaves it untouched.
 
     def run_chunk(index, chunk):
         response = call_llm(build_prompt(context, chunk, refine=refining), config)
