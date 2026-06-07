@@ -33,6 +33,9 @@ class MySQLAdapter(DatabaseAdapter):
             workload_client,
             int(workload_client.get("timeout_seconds", self.runtime_config.get("workload_timeout_seconds", 1800))),
         )
+        self._restart_params = {}
+        self._dynamic_params = {}
+        self._last_dynamic_failed = {}
 
     def _load_parameter_records(self, path):
         records = []
@@ -107,6 +110,14 @@ class MySQLAdapter(DatabaseAdapter):
             return "ON" if value else "OFF"
         return str(value)
 
+    def _mysql_literal(self, value):
+        if isinstance(value, bool):
+            return "ON" if value else "OFF"
+        if isinstance(value, (int, float)):
+            return str(value)
+        escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{escaped}'"
+
     def _default_value(self, record):
         default = record.get("default") or {}
         if isinstance(default, dict) and "mysql" in default:
@@ -122,15 +133,79 @@ class MySQLAdapter(DatabaseAdapter):
             lines.append(f"{name}={self._cnf_value(value)}")
         return "\n".join(lines) + "\n"
 
+    def _connect_admin(self):
+        try:
+            import pymysql
+        except ModuleNotFoundError:
+            return None
+
+        client = self.db_controller.client
+        timeout = int(client.get("timeout_seconds", self.runtime_config.get("workload_timeout_seconds", 1800)))
+        return pymysql.connect(
+            host=str(client.get("host", "127.0.0.1")),
+            port=int(client.get("port", 3306)),
+            user=str(client.get("user", "root")),
+            password=str(client.get("password", "")),
+            autocommit=True,
+            charset="utf8mb4",
+            connect_timeout=10,
+            read_timeout=timeout,
+            write_timeout=timeout,
+        )
+
+    def _apply_dynamic_params(self, dynamic_params):
+        failed = {}
+        if not dynamic_params:
+            return failed
+
+        connection = self._connect_admin()
+        if connection is None:
+            for name, value in dynamic_params.items():
+                sql = f"SET GLOBAL `{name}` = {self._mysql_literal(value)};"
+                result = self.db_controller.run_client(sql=sql, stdout=None, stderr=None, check=False)
+                if result.returncode != 0:
+                    failed[name] = value
+            return failed
+
+        try:
+            with connection.cursor() as cursor:
+                for name, value in dynamic_params.items():
+                    sql = f"SET GLOBAL `{name}` = {self._mysql_literal(value)};"
+                    try:
+                        cursor.execute(sql)
+                    except Exception:
+                        failed[name] = value
+        finally:
+            connection.close()
+        return failed
+
     def apply_config(self, params):
-        # One uniform path for every parameter: write the full set into the config
-        # file and restart. No dynamic SET GLOBAL split — that mix could leave a
-        # session broken when a value was rejected, and made results unreliable.
         true_values = self.get_true_values(params)
-        self.db_controller.write_container_config(self._build_restart_config(true_values))
+        self._restart_params = {}
+        self._dynamic_params = {}
+        self._last_dynamic_failed = {}
+
+        for parameter_id, value in true_values.items():
+            record = self._parameter_record(parameter_id)
+            if bool(record.get("dynamic")):
+                self._dynamic_params[parameter_id] = value
+            else:
+                self._restart_params[parameter_id] = value
+
+        self.db_controller.write_container_config(self._build_restart_config(self._restart_params))
 
     def restart(self):
-        return self.db_controller.restart()
+        stdout, stderr = self.db_controller.restart()
+        if not self.db_controller.wait_until_ready():
+            return stdout, stderr
+
+        failed = self._apply_dynamic_params(self._dynamic_params)
+        self._last_dynamic_failed = failed
+        if failed:
+            self._restart_params.update(failed)
+            self.db_controller.write_container_config(self._build_restart_config(self._restart_params))
+            stdout, stderr = self.db_controller.restart()
+        return stdout, stderr
 
     def health_check(self):
         return bool(self.db_controller.wait_until_ready())
