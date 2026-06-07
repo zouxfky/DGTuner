@@ -5,6 +5,7 @@ from pathlib import Path
 from databases.base import DatabaseAdapter
 from databases.mysql.controller import DEFAULT_RUNTIME_PATH, MySQLController
 from databases.mysql.workload_runner import (
+    configure_query_timeouts,
     configure_workload_client,
     parallel_execute_sqlfile,
     parallel_execute_sqlfile_withinfo,
@@ -199,6 +200,9 @@ class MySQLAdapter(DatabaseAdapter):
             self._restart_required = False
             return self.db_controller.restart()
         return "", ""
+
+    def set_query_timeouts(self, caps_by_index):
+        configure_query_timeouts(caps_by_index)
 
     def clear_output_log(self):
         if os.path.exists(OUTPUT_LOG):

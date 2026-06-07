@@ -92,8 +92,12 @@ def aggregate_repeated_workload(repeat_results):
         for item in repeat["query_info"]:
             bucket = per_sql.setdefault(int(item["sql"]), {"times": [], "status": 0})
             bucket["times"].append(float(item["execution_time"]))
-            if int(item.get("status", 0)) != 0:
+            status = int(item.get("status", 0))
+            # genuine error dominates; otherwise preserve a timeout (124) over OK (0)
+            if status not in (0, 124):
                 bucket["status"] = 1
+            elif status == 124 and bucket["status"] == 0:
+                bucket["status"] = 124
     query_info = [
         {
             "sql": sql_id,
@@ -188,6 +192,7 @@ def run_samples(adapter, planned_samples, workload_path, concurrency, initial_sq
 
 MIN_SAMPLES = 8
 CONCURRENCY = 1
+MIN_QUERY_TIMEOUT = 2.0  # seconds floor so noise can't censor cheap queries
 
 
 def run_probing(
@@ -206,6 +211,7 @@ def run_probing(
     min_sql,
     max_sql,
     workload_repeats,
+    query_timeout_multiple,
     seed,
 ):
     adapter = create_adapter(database, adapter_options)
@@ -230,6 +236,7 @@ def run_probing(
         "min_sql": min_sql,
         "max_sql": max_sql,
         "workload_repeats": workload_repeats,
+        "query_timeout_multiple": query_timeout_multiple,
         "seed": seed,
     }
 
@@ -249,6 +256,18 @@ def run_probing(
             adapter.restart()
         adapter.clear_output_log()
         baseline_workload = run_workload_repeats(adapter, temp_workload_path, CONCURRENCY, workload_repeats)
+        # per-query timeout caps from the baseline (probe-order indices, before remap):
+        # a sampled config's query is censored once it exceeds k x its own baseline.
+        query_caps = {
+            int(item["sql"]): max(MIN_QUERY_TIMEOUT, query_timeout_multiple * float(item["execution_time"]))
+            for item in baseline_workload["query_info"]
+        }
+        adapter.set_query_timeouts(query_caps)
+        print(
+            f"[stage2] per-query timeout = {query_timeout_multiple}x baseline "
+            f"(floor {MIN_QUERY_TIMEOUT}s); censored queries marked, not killed-run",
+            flush=True,
+        )
         remap_probe_sql_ids(baseline_workload["query_info"], initial_sql)
         baseline_result = {
             "record_type": "baseline_result",
@@ -357,7 +376,9 @@ def main():
     parser.add_argument("--sql-corr-threshold", type=float, default=0.95)
     parser.add_argument("--min-sql", type=int, default=1)
     parser.add_argument("--max-sql", type=int, default=None)
-    parser.add_argument("--workload-repeats", type=int, default=2)
+    parser.add_argument("--workload-repeats", type=int, default=1)
+    parser.add_argument("--query-timeout-multiple", type=float, default=2.0,
+                        help="censor a query once it exceeds this multiple of its baseline time")
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
 
@@ -381,6 +402,7 @@ def main():
         min_sql=args.min_sql,
         max_sql=args.max_sql,
         workload_repeats=args.workload_repeats,
+        query_timeout_multiple=args.query_timeout_multiple,
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))

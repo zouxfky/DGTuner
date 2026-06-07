@@ -13,14 +13,31 @@ from dgtuner.common.paths import PROJECT_ROOT
 
 OUTPUT_LOG = str(PROJECT_ROOT / "logfile" / "output.log")
 DEFAULT_TIMEOUT_SECONDS = 1800
+QUERY_TIMEOUT_STATUS = 124
+_MYSQL_QUERY_TIMEOUT_ERRNO = 3024  # ER_QUERY_TIMEOUT (max_execution_time exceeded)
 _SQL_CLIENT = None
 _TIMEOUT_SECONDS = DEFAULT_TIMEOUT_SECONDS
+_QUERY_TIMEOUTS = {}
 
 
 def configure_workload_client(sql_client, timeout_seconds=DEFAULT_TIMEOUT_SECONDS):
     global _SQL_CLIENT, _TIMEOUT_SECONDS
     _SQL_CLIENT = sql_client
     _TIMEOUT_SECONDS = int(timeout_seconds)
+
+
+def configure_query_timeouts(caps_by_index):
+    """Per-query caps in seconds, keyed by 1-based statement index. {} disables."""
+    global _QUERY_TIMEOUTS
+    _QUERY_TIMEOUTS = {int(k): float(v) for k, v in (caps_by_index or {}).items()}
+
+
+def _is_query_timeout(error):
+    code = error.args[0] if getattr(error, "args", None) else None
+    if code == _MYSQL_QUERY_TIMEOUT_ERRNO:
+        return True
+    text = str(error).lower()
+    return "max_execution_time" in text or "maximum statement execution time" in text
 
 
 def _require_client():
@@ -96,8 +113,11 @@ def execute_sqlfile_with_info_python(filepath):
             return None
         with connection.cursor() as cursor:
             for index, sql in enumerate(sql_statements, 1):
+                cap = _QUERY_TIMEOUTS.get(index)
                 start = time.time()
                 try:
+                    if cap:
+                        cursor.execute("SET SESSION MAX_EXECUTION_TIME=%d" % max(1, int(cap * 1000)))
                     cursor.execute(sql)
                     cursor.fetchall()
                     while cursor.nextset():
@@ -107,12 +127,21 @@ def execute_sqlfile_with_info_python(filepath):
                         "execution_time": float(time.time() - start),
                         "sql": index,
                     })
-                except Exception:
-                    execution_info.append({
-                        "status_code": 1,
-                        "execution_time": float(time.time() - start),
-                        "sql": index,
-                    })
+                except Exception as error:
+                    if _is_query_timeout(error):
+                        # censored at the cap: a real, informative "this config made
+                        # this query at least cap-slow" signal, not a hard failure.
+                        execution_info.append({
+                            "status_code": QUERY_TIMEOUT_STATUS,
+                            "execution_time": float(cap) if cap else float(time.time() - start),
+                            "sql": index,
+                        })
+                    else:
+                        execution_info.append({
+                            "status_code": 1,
+                            "execution_time": float(time.time() - start),
+                            "sql": index,
+                        })
         return execution_info
     except TimeoutError:
         return [{"status_code": 124, "execution_time": float(_TIMEOUT_SECONDS), "sql": 1}]

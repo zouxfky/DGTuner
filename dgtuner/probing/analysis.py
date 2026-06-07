@@ -93,7 +93,8 @@ def _per_sql_latency(initial_sql, sample_results):
             if sql_id not in raw:
                 continue
             time_value = float(item["execution_time"])
-            if int(item.get("status", 0)) == 0:
+            # status 124 = censored at the per-query cap; still a valid (high) latency
+            if int(item.get("status", 0)) in (0, 124):
                 successful[sql_id].append(time_value)
                 raw[sql_id][config_index] = time_value
 
