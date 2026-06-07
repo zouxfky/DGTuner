@@ -5,7 +5,6 @@ from pathlib import Path
 from databases.base import DatabaseAdapter
 from databases.mysql.controller import DEFAULT_RUNTIME_PATH, MySQLController
 from databases.mysql.workload_runner import (
-    configure_query_timeouts,
     configure_workload_client,
     parallel_execute_sqlfile,
     parallel_execute_sqlfile_withinfo,
@@ -34,7 +33,6 @@ class MySQLAdapter(DatabaseAdapter):
             workload_client,
             int(workload_client.get("timeout_seconds", self.runtime_config.get("workload_timeout_seconds", 1800))),
         )
-        self._restart_required = False
 
     def _load_parameter_records(self, path):
         records = []
@@ -104,14 +102,6 @@ class MySQLAdapter(DatabaseAdapter):
             return str(value)
         return value
 
-    def _mysql_literal(self, value):
-        if isinstance(value, bool):
-            return "ON" if value else "OFF"
-        if isinstance(value, (int, float)):
-            return str(value)
-        escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
-        return f"'{escaped}'"
-
     def _cnf_value(self, value):
         if isinstance(value, bool):
             return "ON" if value else "OFF"
@@ -132,77 +122,21 @@ class MySQLAdapter(DatabaseAdapter):
             lines.append(f"{name}={self._cnf_value(value)}")
         return "\n".join(lines) + "\n"
 
-    def _connect_admin(self):
-        try:
-            import pymysql
-        except ModuleNotFoundError:
-            return None
-
-        client = self.db_controller.client
-        return pymysql.connect(
-            host=str(client.get("host", "127.0.0.1")),
-            port=int(client.get("port", 3306)),
-            user=str(client.get("user", "root")),
-            password=str(client.get("password", "")),
-            autocommit=True,
-            charset="utf8mb4",
-            connect_timeout=10,
-            read_timeout=int(client.get("timeout_seconds", self.runtime_config.get("workload_timeout_seconds", 1800))),
-            write_timeout=int(client.get("timeout_seconds", self.runtime_config.get("workload_timeout_seconds", 1800))),
-        )
-
-    def _apply_dynamic_params(self, dynamic_params):
-        failed = {}
-        if not dynamic_params:
-            return failed
-
-        connection = self._connect_admin()
-        if connection is None:
-            for name, value in dynamic_params.items():
-                sql = f"SET GLOBAL `{name}` = {self._mysql_literal(value)};"
-                result = self.db_controller.run_client(sql=sql, stdout=None, stderr=None, check=False)
-                if result.returncode != 0:
-                    failed[name] = value
-            return failed
-
-        try:
-            with connection.cursor() as cursor:
-                for name, value in dynamic_params.items():
-                    sql = f"SET GLOBAL `{name}` = {self._mysql_literal(value)};"
-                    try:
-                        cursor.execute(sql)
-                    except Exception:
-                        failed[name] = value
-        finally:
-            connection.close()
-        return failed
-
     def apply_config(self, params):
+        # One uniform path for every parameter: write the full set into the config
+        # file and restart. No dynamic SET GLOBAL split — that mix could leave a
+        # session broken when a value was rejected, and made results unreliable.
         true_values = self.get_true_values(params)
-        dynamic_params = {}
-        restart_params = {}
-
-        for parameter_id, value in true_values.items():
-            record = self._parameter_record(parameter_id)
-            if bool(record.get("dynamic")):
-                dynamic_params[parameter_id] = value
-            else:
-                restart_params[parameter_id] = value
-
-        restart_params.update(self._apply_dynamic_params(dynamic_params))
-
-        self._restart_required = bool(restart_params)
-        if restart_params:
-            self.db_controller.write_container_config(self._build_restart_config(restart_params))
+        self.db_controller.write_container_config(self._build_restart_config(true_values))
 
     def restart(self):
-        if self._restart_required:
-            self._restart_required = False
-            return self.db_controller.restart()
-        return "", ""
+        return self.db_controller.restart()
 
-    def set_query_timeouts(self, caps_by_index):
-        configure_query_timeouts(caps_by_index)
+    def health_check(self):
+        return bool(self.db_controller.wait_until_ready())
+
+    def recent_logs(self, lines=40):
+        return self.db_controller.tail_logs(lines)
 
     def clear_output_log(self):
         if os.path.exists(OUTPUT_LOG):

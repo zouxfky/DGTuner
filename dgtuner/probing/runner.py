@@ -92,12 +92,8 @@ def aggregate_repeated_workload(repeat_results):
         for item in repeat["query_info"]:
             bucket = per_sql.setdefault(int(item["sql"]), {"times": [], "status": 0})
             bucket["times"].append(float(item["execution_time"]))
-            status = int(item.get("status", 0))
-            # genuine error dominates; otherwise preserve a timeout (124) over OK (0)
-            if status not in (0, 124):
+            if int(item.get("status", 0)) != 0:
                 bucket["status"] = 1
-            elif status == 124 and bucket["status"] == 0:
-                bucket["status"] = 124
     query_info = [
         {
             "sql": sql_id,
@@ -134,10 +130,16 @@ def apply_and_run(adapter, sample, workload_path, concurrency, repeats, baseline
     adapter.apply_config(sample)
     if hasattr(adapter, "restart"):
         adapter.restart()
+    baseline_time = max(float(baseline_time), 1e-9)
+    if not adapter.health_check():
+        # The DB did not start with this config: the sampled values/combination are
+        # out of MySQL's accepted bounds. That is a knowledge-base range problem to
+        # fix, not a "bad config" to swallow — fail loudly with the offending values.
+        logs = adapter.recent_logs() if hasattr(adapter, "recent_logs") else ""
+        raise UnhealthyConfigError(applied, logs)
     adapter.clear_output_log()
     workload_result = run_workload_repeats(adapter, workload_path, concurrency, repeats)
     total_time = float(workload_result["total_time"])
-    baseline_time = max(float(baseline_time), 1e-9)
     return {
         "applied_params": applied,
         "total_time": total_time,
@@ -172,7 +174,22 @@ def run_samples(adapter, planned_samples, workload_path, concurrency, initial_sq
     for sample_id, sample_entry in enumerate(planned_samples):
         sample = sample_entry["params"]
         start = time.time()
-        run_result = apply_and_run(adapter, sample, workload_path, concurrency, repeats, baseline_time)
+        try:
+            run_result = apply_and_run(adapter, sample, workload_path, concurrency, repeats, baseline_time)
+        except UnhealthyConfigError as error:
+            print(
+                f"[stage2] sample {sample_id + 1}/{total} ABORTED: database failed to start "
+                f"with this config — a knob range produced a rejected value/combination. "
+                f"Tighten the offending range(s) in the knowledge base and rerun.",
+                flush=True,
+            )
+            print("[stage2] offending applied values:", flush=True)
+            for key in sorted(error.applied_params):
+                print(f"    {key} = {error.applied_params[key]}", flush=True)
+            if error.logs:
+                print("[stage2] --- database log (tail) ---", flush=True)
+                print(error.logs, flush=True)
+            raise
         remap_probe_sql_ids(run_result["query_info"], initial_sql)
         sample_results.append({
             "record_type": "sample_result",
@@ -192,7 +209,15 @@ def run_samples(adapter, planned_samples, workload_path, concurrency, initial_sq
 
 MIN_SAMPLES = 8
 CONCURRENCY = 1
-MIN_QUERY_TIMEOUT = 2.0  # seconds floor so noise can't censor cheap queries
+
+
+class UnhealthyConfigError(RuntimeError):
+    """Raised when a sampled config prevents the DB from starting (range problem)."""
+
+    def __init__(self, applied_params, logs=""):
+        self.applied_params = applied_params
+        self.logs = logs
+        super().__init__("Database did not start with a sampled config.")
 
 
 def run_probing(
@@ -211,7 +236,6 @@ def run_probing(
     min_sql,
     max_sql,
     workload_repeats,
-    query_timeout_multiple,
     seed,
 ):
     adapter = create_adapter(database, adapter_options)
@@ -236,7 +260,6 @@ def run_probing(
         "min_sql": min_sql,
         "max_sql": max_sql,
         "workload_repeats": workload_repeats,
-        "query_timeout_multiple": query_timeout_multiple,
         "seed": seed,
     }
 
@@ -254,20 +277,18 @@ def run_probing(
         adapter.apply_config(default_sample)
         if hasattr(adapter, "restart"):
             adapter.restart()
+        if not adapter.health_check():
+            logs = adapter.recent_logs() if hasattr(adapter, "recent_logs") else ""
+            if logs:
+                print("[stage2] --- database log (tail) ---", flush=True)
+                print(logs, flush=True)
+            raise RuntimeError(
+                "Database did not start with the default parameter set. A kept knob may "
+                "not be a valid startup option, or the default config is rejected. See the "
+                "database log above."
+            )
         adapter.clear_output_log()
         baseline_workload = run_workload_repeats(adapter, temp_workload_path, CONCURRENCY, workload_repeats)
-        # per-query timeout caps from the baseline (probe-order indices, before remap):
-        # a sampled config's query is censored once it exceeds k x its own baseline.
-        query_caps = {
-            int(item["sql"]): max(MIN_QUERY_TIMEOUT, query_timeout_multiple * float(item["execution_time"]))
-            for item in baseline_workload["query_info"]
-        }
-        adapter.set_query_timeouts(query_caps)
-        print(
-            f"[stage2] per-query timeout = {query_timeout_multiple}x baseline "
-            f"(floor {MIN_QUERY_TIMEOUT}s); censored queries marked, not killed-run",
-            flush=True,
-        )
         remap_probe_sql_ids(baseline_workload["query_info"], initial_sql)
         baseline_result = {
             "record_type": "baseline_result",
@@ -377,8 +398,6 @@ def main():
     parser.add_argument("--min-sql", type=int, default=1)
     parser.add_argument("--max-sql", type=int, default=None)
     parser.add_argument("--workload-repeats", type=int, default=1)
-    parser.add_argument("--query-timeout-multiple", type=float, default=2.0,
-                        help="censor a query once it exceeds this multiple of its baseline time")
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
 
@@ -402,7 +421,6 @@ def main():
         min_sql=args.min_sql,
         max_sql=args.max_sql,
         workload_repeats=args.workload_repeats,
-        query_timeout_multiple=args.query_timeout_multiple,
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))

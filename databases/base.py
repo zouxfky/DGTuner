@@ -13,11 +13,14 @@ class DatabaseAdapter:
     def normalize_logged_knob_name(self, knob_name):
         return knob_name
 
-    def set_query_timeouts(self, caps_by_index):
-        """Optional: per-query execution-time caps in seconds, keyed by 1-based
-        statement index within the workload file. No-op unless an adapter supports
-        a per-query timeout (e.g. MySQL MAX_EXECUTION_TIME)."""
-        return None
+    def health_check(self):
+        """Return True if the DB is up and serving after a config apply/restart.
+        Default True for adapters that cannot fail to start."""
+        return True
+
+    def recent_logs(self, lines=40):
+        """Return recent server log lines (for diagnosing a failed start). Empty by default."""
+        return ""
 
     def apply_config(self, params):
         raise NotImplementedError

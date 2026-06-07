@@ -146,6 +146,17 @@ class MySQLController:
             time.sleep(1)
         return False
 
+    def tail_logs(self, lines=40):
+        """Return the last `lines` of the container log (where MySQL startup errors
+        like 'unknown variable' or 'out of range' surface)."""
+        if not self.container:
+            return ""
+        result = subprocess.run(
+            ["docker", "logs", "--tail", str(int(lines)), str(self.container)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        return result.stdout or ""
+
     def write_container_config(self, content):
         mysql_runtime = self.runtime.get("mysql_runtime") or {}
         container = mysql_runtime.get("container")

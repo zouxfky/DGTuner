@@ -79,8 +79,7 @@ def per_sql_log_ratio_targets(sample_results, baseline_query_info):
             latency = None
             for item in res.get("query_info", []):
                 if int(item["sql"]) == sql_id:
-                    # status 124 = censored at the cap; keep it as a valid high latency
-                    if int(item.get("status", 0)) in (0, 124):
+                    if int(item.get("status", 0)) == 0:
                         latency = float(item["execution_time"])
                     break
             if latency is None or latency <= 0:
