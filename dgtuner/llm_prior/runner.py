@@ -43,14 +43,22 @@ def load_existing_decisions(output_path, parameter_ids):
     return decisions
 
 
+PENDING_REASON = "Pending LLM decision; keep conservatively until this chunk completes."
+
+
 def build_records(parameters, decisions):
     records = []
     for record in parameters:
         param_id = parameter_id(record)
-        decision = decisions.get(param_id, {
-            "keep": 1,
-            "reason": "Pending LLM decision; keep conservatively until this chunk completes.",
-        })
+        # Fall back to the record's own existing keep/reason (refine survivors carry
+        # theirs) so a chunk that never returned is not overwritten with a
+        # placeholder — a fully failed run then leaves the file untouched.
+        if param_id in decisions:
+            decision = decisions[param_id]
+        elif "keep" in record and record.get("reason"):
+            decision = {"keep": int(record.get("keep", 1)), "reason": record["reason"]}
+        else:
+            decision = {"keep": 1, "reason": PENDING_REASON}
         output_record = dict(record)
         output_record["keep"] = decision["keep"]
         output_record["reason"] = decision["reason"]
@@ -66,15 +74,16 @@ def flush_records(output_path, parameters, decisions, frozen=None):
 def load_refine_inputs(output_path):
     """Refine mode: re-prune only the survivors (keep==1) of a previous run.
 
-    Returns (candidates, frozen) where candidates are the survivors with their old
-    keep/reason stripped so they get re-decided fresh, and frozen are the already
-    removed records, preserved verbatim so the output file stays complete.
+    Returns (candidates, frozen): candidates are the survivors kept verbatim (their
+    old keep/reason are retained as a fallback, so a chunk that never returns leaves
+    them unchanged); frozen are the already-removed records, preserved verbatim so
+    the output file stays complete.
     """
     existing = read_jsonl(output_path)
     candidates, frozen = [], []
     for record in existing:
         if int(record.get("keep", 1)) == 1:
-            candidates.append({k: v for k, v in record.items() if k not in ("keep", "reason")})
+            candidates.append(dict(record))
         else:
             frozen.append(record)
     return candidates, frozen
@@ -142,7 +151,7 @@ def run_pruning(parameters_path, context_path, output_path, params_per_prompt, l
     completed_count = sum(
         1
         for record in records
-        if record.get("reason") != "Pending LLM decision; keep conservatively until this chunk completes."
+        if record.get("reason") != PENDING_REASON
     )
     return {
         "output": str(output_path),
