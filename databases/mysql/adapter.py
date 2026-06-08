@@ -198,20 +198,21 @@ class MySQLAdapter(DatabaseAdapter):
         stdout, stderr = self.db_controller.restart()
         if not self.db_controller.wait_until_ready():
             return stdout, stderr
-
-        failed = self._apply_dynamic_params(self._dynamic_params)
-        self._last_dynamic_failed = failed
-        if failed:
-            self._restart_params.update(failed)
-            self.db_controller.write_container_config(self._build_restart_config(self._restart_params))
-            stdout, stderr = self.db_controller.restart()
+        # Apply dynamic knobs once. A failed SET GLOBAL is treated as a bad config
+        # (surfaced by health_check), not auto-recovered by re-routing to the cnf.
+        self._last_dynamic_failed = self._apply_dynamic_params(self._dynamic_params)
         return stdout, stderr
 
     def health_check(self):
-        return bool(self.db_controller.wait_until_ready())
+        # Healthy only if the server is up AND every dynamic knob was accepted.
+        return bool(self.db_controller.wait_until_ready()) and not self._last_dynamic_failed
 
     def recent_logs(self, lines=40):
-        return self.db_controller.tail_logs(lines)
+        logs = self.db_controller.tail_logs(lines)
+        if self._last_dynamic_failed:
+            failed = ", ".join(f"{k}={v}" for k, v in sorted(self._last_dynamic_failed.items()))
+            logs = (logs + "\n" if logs else "") + f"[adapter] SET GLOBAL rejected: {failed}"
+        return logs
 
     def clear_output_log(self):
         if os.path.exists(OUTPUT_LOG):
