@@ -230,7 +230,7 @@ def run_probing(
     adapter_options,
     similarity_threshold,
     initial_sql_percent,
-    importance_threshold,
+    relevance_multiple,
     bagging_rounds,
     sql_corr_threshold,
     min_sql,
@@ -254,7 +254,7 @@ def run_probing(
         "samples": samples,
         "similarity_threshold": similarity_threshold,
         "initial_sql_percent": initial_sql_percent,
-        "importance_threshold": importance_threshold,
+        "relevance_multiple": relevance_multiple,
         "bagging_rounds": bagging_rounds,
         "sql_corr_threshold": sql_corr_threshold,
         "min_sql": min_sql,
@@ -321,7 +321,7 @@ def run_probing(
         parameters,
         sample_results,
         baseline_query_info=baseline_result["query_info"],
-        importance_threshold=importance_threshold,
+        relevance_multiple=relevance_multiple,
         bagging_rounds=bagging_rounds,
         seed=seed,
     )
@@ -392,7 +392,8 @@ def main():
     parser.add_argument("--adapter-option", action="append", default=[])
     parser.add_argument("--similarity-threshold", type=float, default=0.9)
     parser.add_argument("--initial-sql-percent", type=float, default=10.0)
-    parser.add_argument("--importance-threshold", type=float, default=0.01)
+    parser.add_argument("--relevance-multiple", type=float, default=3.0,
+                        help="keep a knob whose ARD relevance >= this x the median (noise floor)")
     parser.add_argument("--bagging-rounds", type=int, default=5)
     parser.add_argument("--sql-corr-threshold", type=float, default=0.95)
     parser.add_argument("--min-sql", type=int, default=1)
@@ -415,7 +416,7 @@ def main():
         adapter_options=parse_adapter_options(args.adapter_option),
         similarity_threshold=args.similarity_threshold,
         initial_sql_percent=args.initial_sql_percent,
-        importance_threshold=args.importance_threshold,
+        relevance_multiple=args.relevance_multiple,
         bagging_rounds=args.bagging_rounds,
         sql_corr_threshold=args.sql_corr_threshold,
         min_sql=args.min_sql,

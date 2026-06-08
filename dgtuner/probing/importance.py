@@ -117,15 +117,17 @@ def fit_ard_lengthscales(matrix, targets, seed):
     length_scale = np.atleast_1d(model.kernel_.k1.k2.length_scale).astype(float)
     if length_scale.size == 1:
         length_scale = np.full(feature_count, float(length_scale[0]))
-    return np.clip(length_scale, 1e-6, None)
+    return np.clip(length_scale, 1e-2, None)
 
 
-def aggregate_relevance(matrix, targets, selection_threshold, bagging_rounds, seed):
+def aggregate_relevance(matrix, targets, relevance_multiple, bagging_rounds, seed):
     """Average ARD relevance (1/length-scale) over subsampled GP fits.
 
-    Per round a knob is "selected" when its relevance share crosses the threshold;
-    selection_frequency is the fraction of rounds in which that happened (stability
-    selection over the unstable per-dimension length-scale estimates).
+    Per round a knob is "selected" when its relevance is at least ``relevance_multiple``
+    times the round's median relevance (the noise floor). Using the median, not the
+    sum, makes selection robust to one knob with an outsized relevance — a dominant
+    knob no longer suppresses the shares of other genuinely relevant knobs.
+    selection_frequency is the fraction of rounds in which a knob was selected.
     """
     n_rows, feature_count = matrix.shape
     rng = np.random.RandomState(seed)
@@ -145,9 +147,9 @@ def aggregate_relevance(matrix, targets, selection_threshold, bagging_rounds, se
         relevance = 1.0 / length_scale
         relevance_rounds.append(relevance)
         lengthscale_rounds.append(length_scale)
-        total = float(relevance.sum())
-        share = relevance / total if total > 0 else np.zeros(feature_count)
-        selection_counts += (share >= selection_threshold).astype(float)
+        median = float(np.median(relevance))
+        cut = relevance_multiple * median if median > 0 else 0.0
+        selection_counts += (relevance >= cut).astype(float) if cut > 0 else np.zeros(feature_count)
 
     mean_relevance = np.mean(relevance_rounds, axis=0)
     mean_lengthscale = np.mean(lengthscale_rounds, axis=0)
@@ -155,7 +157,7 @@ def aggregate_relevance(matrix, targets, selection_threshold, bagging_rounds, se
     return mean_relevance, mean_lengthscale, selection_frequency
 
 
-def per_sql_selection(matrix, sample_results, baseline_query_info, selection_threshold, bagging_rounds, seed):
+def per_sql_selection(matrix, sample_results, baseline_query_info, relevance_multiple, bagging_rounds, seed):
     """Run ARD relevance per heavy SQL; return [(sql_id, weight, frequency[], lengthscale[])]."""
     if baseline_query_info is None:
         return []
@@ -173,7 +175,7 @@ def per_sql_selection(matrix, sample_results, baseline_query_info, selection_thr
         if float(np.ptp(sub_y)) <= 0.0:
             continue
         _, mean_lengthscale, frequency = aggregate_relevance(
-            sub_x, sub_y, selection_threshold, bagging_rounds, seed + 1000 * (offset + 1)
+            sub_x, sub_y, relevance_multiple, bagging_rounds, seed + 1000 * (offset + 1)
         )
         selections.append((int(sql_id), float(weight), frequency, mean_lengthscale))
     return selections
@@ -183,7 +185,7 @@ def rank_parameters_by_importance(
     parameters,
     sample_results,
     baseline_query_info=None,
-    importance_threshold=0.01,
+    relevance_multiple=3.0,
     bagging_rounds=5,
     seed=2026,
 ):
@@ -197,10 +199,10 @@ def rank_parameters_by_importance(
 
     if usable:
         mean_relevance, mean_lengthscale, freq_total = aggregate_relevance(
-            matrix, targets, importance_threshold, bagging_rounds, seed
+            matrix, targets, relevance_multiple, bagging_rounds, seed
         )
         sql_selections = per_sql_selection(
-            matrix, sample_results, baseline_query_info, importance_threshold, bagging_rounds, seed
+            matrix, sample_results, baseline_query_info, relevance_multiple, bagging_rounds, seed
         )
     else:
         mean_relevance = np.zeros(feature_count)
@@ -258,7 +260,7 @@ def rank_parameters_by_importance(
             "mean_lengthscale": lengthscale,
             "total_selection_frequency": total_frequency,
             "relevant_for_sql": driving_sql,
-            "selection_threshold": importance_threshold,
+            "relevance_multiple": relevance_multiple,
             "protected": protected,
         })
 
